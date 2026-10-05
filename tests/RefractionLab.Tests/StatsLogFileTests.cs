@@ -72,6 +72,19 @@ public sealed class StatsLogFileTests : IDisposable
     }
 
     [Fact]
+    public void EventRowsKeepTheCallersApiLabelSoTheyMatchSampleRows()
+    {
+        using StatsLogFile log = StatsLogFile.Create(_dir, "dxgi-thread", At);
+        log.WriteEvent("start");
+        log.WriteSample(Sample() with { Api = "dxgi-thread" });
+
+        string[] lines = ReadWhileOpen(log.FilePath);
+        Assert.Equal("dxgi-thread", StatsCsvTests.Split(lines[1])[2]);   // event row
+        Assert.Equal("dxgi-thread", StatsCsvTests.Split(lines[2])[2]);   // sample row
+        Assert.Matches(@"^stats-dxgithread-", Path.GetFileName(log.FilePath)); // the file name stays sanitized
+    }
+
+    [Fact]
     public void AnUnusableLocationFailsWithAnExceptionTheAppHandles()
     {
         Directory.CreateDirectory(_dir);

@@ -64,8 +64,9 @@ public sealed class StatsLogFile : IDisposable
         }
     }
 
+    // The file name is sanitized in Create; event rows keep the caller's label so they match sample rows.
     internal static StatsLogFile ForStream(Stream stream, string path, string api) =>
-        new(stream, path, SafeName(api));
+        new(stream, path, api);
 
     public void WriteSample(StatsSample sample) =>
         Write(StatsCsv.Row(DateTimeOffset.UtcNow, ElapsedSeconds, sample));

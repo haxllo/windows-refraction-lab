@@ -107,6 +107,8 @@ public sealed partial class MainWindow : Window
     private readonly LatencyWindow _dispatchLag = new();   // throttle fire -> handler runs on the UI thread
     private readonly LatencyWindow _renderLag = new();     // Invalidate -> Draw event
     private LatencySummary _dispatchSummary, _renderSummary;
+    private readonly LatencyWindow _paintLag = new(), _blitLag = new(), _presentLag = new(), _renderTotal = new();   // render thread, per phase
+    private LatencySummary _paintSummary, _blitSummary, _presentSummary, _totalSummary;
 
     public MainWindow()
     {
@@ -538,6 +540,10 @@ public sealed partial class MainWindow : Window
     private void OnRenderFrame(RenderFrame frame)
     {
         _renderLag.Add(frame.WaitMs);
+        _paintLag.Add(frame.PaintMs);
+        _blitLag.Add(frame.BlitMs);
+        _presentLag.Add(frame.PresentMs);
+        _renderTotal.Add(frame.PaintMs + frame.BlitMs + frame.PresentMs);
         _counters.Add(Stage.Drawn);
         Volatile.Write(ref _drawMs, frame.DrawMs);
         Volatile.Write(ref _ageMs, AgeMs(Interlocked.Read(ref _ddaPresentTicks)));
@@ -739,8 +745,9 @@ public sealed partial class MainWindow : Window
         StartThreadedRenderer();
         if (_throttle is not null)
             _throttle.Interval = _minFrameInterval;
+        string notes = string.Join("; ", new[] { _borderNote, _renderNote }.Where(n => n.Length > 0));
         LogEvent("refracting", string.Create(CultureInfo.InvariantCulture,
-            $"probe_seen={_controlFraction:0.00} probe_clear={_clearFraction:0.00}"));
+            $"probe_seen={_controlFraction:0.00} probe_clear={_clearFraction:0.00}") + (notes.Length > 0 ? $" note={notes}" : string.Empty));
         string border = _borderNote.Length > 0 ? $"  ·  {_borderNote}" : string.Empty;
         string render = _renderNote.Length > 0 ? $"  ·  {_renderNote}" : string.Empty;
         SetStatus($"{source}  ·  exclusion verified (probe seen {_controlFraction:P0} → {_clearFraction:P0})  ·  only the panel crop is kept, in GPU memory{border}{render}");
@@ -954,7 +961,12 @@ public sealed partial class MainWindow : Window
         _counters.TakeRates(TimeSpan.FromSeconds(1));
         _dispatchLag.Take();
         _renderLag.Take();
+        _paintLag.Take();
+        _blitLag.Take();
+        _presentLag.Take();
+        _renderTotal.Take();
         _dispatchSummary = _renderSummary = default;
+        _paintSummary = _blitSummary = _presentSummary = _totalSummary = default;
         _rates = default;
         _lastDdaSource = 0;
         _fpsWindowStart = Stopwatch.GetTimestamp();
@@ -970,7 +982,8 @@ public sealed partial class MainWindow : Window
         {
             _log = StatsLogFile.Create(StatsLogFile.DefaultDirectory(), api, DateTimeOffset.Now);
             LogEvent("start", string.Create(CultureInfo.InvariantCulture,
-                $"max_fps={FramePacing.Label(_maxFpsSetting)} display_hz={_displayHz} bend_pct={(int)Math.Round(BendSlider.Value)}"));
+                $"max_fps={FramePacing.Label(_maxFpsSetting)} display_hz={_displayHz} bend_pct={(int)Math.Round(BendSlider.Value)} " +
+                $"borderless_checkbox={(BorderlessBox.IsChecked == true ? 1 : 0)}"));
         }
         catch (Exception ex) when (StatsLogFile.IsIoFailure(ex))
         {
@@ -992,7 +1005,10 @@ public sealed partial class MainWindow : Window
             dda ? (_renderer is not null ? "dxgi-thread" : "dxgi") : "wgc", FramePacing.Label(_maxFpsSetting), _displayHz, (int)Math.Round(BendSlider.Value),
             _rates.Source, _rates.Used, _rates.Drawn, _ageMs, _copyMs, _drawMs,
             _dispatchSummary, _renderSummary, dda ? Volatile.Read(ref _ddaLockMs) : (double?)null,
-            _cpuPct, Environment.WorkingSet / (1024 * 1024), Volatile.Read(ref _ddaProtected)));
+            _cpuPct, Environment.WorkingSet / (1024 * 1024), Volatile.Read(ref _ddaProtected),
+            _renderer is not null
+                ? new RenderTiming(_paintSummary.AvgMs, _blitSummary.AvgMs, _presentSummary.AvgMs, _totalSummary.MaxMs)
+                : (RenderTiming?)null));
     }
 
     private string LogStatusLine()
@@ -1043,6 +1059,10 @@ public sealed partial class MainWindow : Window
         _rates = _counters.TakeRates(Stopwatch.GetElapsedTime(_fpsWindowStart, now));
         _dispatchSummary = _dispatchLag.Take();
         _renderSummary = _renderLag.Take();
+        _paintSummary = _paintLag.Take();
+        _blitSummary = _blitLag.Take();
+        _presentSummary = _presentLag.Take();
+        _totalSummary = _renderTotal.Take();
         _fpsWindowStart = now;
 
         TimeSpan cpu = _process.TotalProcessorTime;
@@ -1058,7 +1078,10 @@ public sealed partial class MainWindow : Window
         string lag = (_renderer is not null
                 ? $"lag avg/max ms: request→draw start {_renderSummary.AvgMs:0}/{_renderSummary.MaxMs:0} · render thread (no UI hop)"
                 : $"lag avg/max ms: ui queue {_dispatchSummary.AvgMs:0}/{_dispatchSummary.MaxMs:0} · invalidate→draw {_renderSummary.AvgMs:0}/{_renderSummary.MaxMs:0}") +
-            (_api == CaptureApi.Duplication ? $" · device lock {Volatile.Read(ref _ddaLockMs):0.0}" : string.Empty);
+            (_api == CaptureApi.Duplication ? $" · device lock {Volatile.Read(ref _ddaLockMs):0.0}" : string.Empty) +
+            (_renderer is not null
+                ? $"\nrender avg ms: paint {_paintSummary.AvgMs:0.0} · blit {_blitSummary.AvgMs:0.0} · present {_presentSummary.AvgMs:0.0} (slowest frame {_totalSummary.MaxMs:0})"
+                : string.Empty);
         MetricsText.Text = _mode == Mode.Refracting
             ? $"{(_api == CaptureApi.Duplication ? "DXGI" : "WGC")} · per second: source {_rates.Source:0} → used {_rates.Used:0} → drawn {_rates.Drawn:0} (display {hz}) · age {_ageMs:0} ms · copy {_copyMs:0.0} ms · draw {_drawMs:0.0} ms · CPU {_cpuPct:0}% of 1 core · {Environment.WorkingSet / (1024 * 1024)} MB\n{lag}" +
               (Volatile.Read(ref _ddaProtected) ? " · protected content is masked (black) on this display" : string.Empty) + LogStatusLine()
@@ -1069,7 +1092,7 @@ public sealed partial class MainWindow : Window
     {
         _closing = true;
         PowerManager.EnergySaverStatusChanged -= OnEnergySaverChanged;
-        StopCapture(string.Empty);
+        StopCapture("Window closed.");
         _process.Dispose();
     }
 }

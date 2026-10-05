@@ -7,7 +7,7 @@ using Windows.UI;
 
 namespace RefractionLab.Render;
 
-internal readonly record struct RenderFrame(double WaitMs, double DrawMs);
+internal readonly record struct RenderFrame(double WaitMs, double DrawMs, double PaintMs, double BlitMs, double PresentMs);
 
 /// <summary>
 /// Draws the refraction on its own thread and presents it through a swap chain, so the UI thread is
@@ -87,10 +87,12 @@ internal sealed class ThreadedRenderer : IDisposable
                     continue;
 
                 long started = Stopwatch.GetTimestamp();
-                DrawOnce();
-                double drawMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                (double paintMs, double blitMs) = DrawOnce();
+                long beforePresent = Stopwatch.GetTimestamp();
                 _swapChain.Present(); // paced to the display; blocks this thread, never the UI thread
-                _onFrame(new RenderFrame(Stopwatch.GetElapsedTime(requested, started).TotalMilliseconds, drawMs));
+                double presentMs = Stopwatch.GetElapsedTime(beforePresent).TotalMilliseconds;
+                _onFrame(new RenderFrame(
+                    Stopwatch.GetElapsedTime(requested, started).TotalMilliseconds, paintMs + blitMs, paintMs, blitMs, presentMs));
             }
         }
         catch (Exception ex)
@@ -100,28 +102,36 @@ internal sealed class ThreadedRenderer : IDisposable
         }
     }
 
-    private void DrawOnce()
+    // Each phase includes its drawing session's disposal, which is where Direct2D submits the work.
+    private (double PaintMs, double BlitMs) DrawOnce()
     {
         var size = _target.SizeInPixels;
         float w = size.Width, h = size.Height;
 
+        long t0 = Stopwatch.GetTimestamp();
         using (CanvasDrawingSession ds = _target.CreateDrawingSession())
         {
             ds.Clear(Backdrop);
             _painter.Draw(_device, ds, _crop, _padPx, w, h, _radiusPx, _bezelPx, _blurPx, _shiftPx());
         }
+        long t1 = Stopwatch.GetTimestamp();
 
         // One plain copy with explicit rectangles: the whole target (pixels at 96 DPI) onto the whole
         // swap chain (DIPs at the display's DPI), sized from its real pixel count so the copy is exactly
         // 1:1. Nearest-neighbour so it cannot soften anything.
         var swapPx = _swapChain.SizeInPixels;
-        using CanvasDrawingSession present = _swapChain.CreateDrawingSession(Backdrop);
-        present.DrawImage(
-            _target,
-            new Rect(0, 0, swapPx.Width / _scale, swapPx.Height / _scale),
-            new Rect(0, 0, w, h),
-            1f,
-            CanvasImageInterpolation.NearestNeighbor);
+        using (CanvasDrawingSession present = _swapChain.CreateDrawingSession(Backdrop))
+        {
+            present.DrawImage(
+                _target,
+                new Rect(0, 0, swapPx.Width / _scale, swapPx.Height / _scale),
+                new Rect(0, 0, w, h),
+                1f,
+                CanvasImageInterpolation.NearestNeighbor);
+        }
+        long t2 = Stopwatch.GetTimestamp();
+
+        return (Stopwatch.GetElapsedTime(t0, t1).TotalMilliseconds, Stopwatch.GetElapsedTime(t1, t2).TotalMilliseconds);
     }
 
     public void Dispose()

@@ -568,6 +568,10 @@ public sealed partial class MainWindow : Window
                 (float)(CornerDip * _scale), (float)(BezelDip * _scale), (float)(BlurDip * _scale),
                 () => (float)(_bendPct / 100.0 * MaxShiftDip * _scale), OnRenderFrame, OnRenderFault);
             SwapPanel.SwapChain = renderer.SwapChain;
+            // A swap chain does not stretch to its panel, and a panel with no children and no size can
+            // measure to 0x0, so give it the window's exact size in DIPs.
+            SwapPanel.Width = client.Width / _scale;
+            SwapPanel.Height = client.Height / _scale;
             SwapPanel.Visibility = Visibility.Visible;
             _renderer = renderer;
             renderer.Start();

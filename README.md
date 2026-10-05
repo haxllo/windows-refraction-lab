@@ -69,10 +69,11 @@ Only the grid's pixels are read back; the rest of the frame stays in the OS-owne
 |---|---|
 | Logic unit tests (`ProbePattern`, `CropMath`, `BezelMap`) | 31 passed. Three deliberate mutations (matcher always matches, bezel pointing outward, ignoring monitor origin) each made tests fail. |
 | Package restore | Passes. The committed project previously failed with NU1605 (an explicit `Microsoft.Windows.SDK.BuildTools` pin below the version Windows App SDK requires); the pin was removed. |
-| C# type-check of `src/` against Windows App SDK 1.8.260804001, Win2D 1.4.0 and the Windows SDK projections | 0 errors. XAML-generated members were stubbed; an injected error was caught. This is a compile check, not a build: the XAML compiler and `makepri.exe` are Windows-only executables. |
+| C# type-check of `src/` against Windows App SDK 1.8.260804001, Win2D 1.4.0 and the Windows SDK projections | 0 errors. XAML-generated members were stubbed; an injected error was caught. This is a compile check only: the XAML compiler and `makepri.exe` are Windows-only executables, so it could not see XAML errors. |
+| Windows build in CI (`windows-latest`): `dotnet build` and self-contained `dotnet publish`, `RefractionLab.exe` present | Passes. The first run failed with a XAML parse error (WMC9997: `--` inside an XML comment) that the Linux type-check could not detect; fixed. This proves the project compiles and packages, not that it runs. |
 | Displacement-look simulation (numpy, using the real `BezelMap` output and Win2D's documented formula) | Interior unchanged, rim bends, text stays legible at default Bend. This checks the math only; it is not a screenshot of the app. |
 
-**Not run, so not claimed:** XAML compile and publish on Windows (the included `ci` workflow does this on `windows-latest`; check its result), launching the app, the picker, the probe handshake on real hardware, Win2D rendering, DPI scaling, and every latency/CPU/GPU/battery number. The app has in-panel counters (accepted fps, frame age from `SystemRelativeTime`, crop-copy time, draw submission time, process CPU, working set) for collecting those on a target machine. GPU engine time and battery drain need Task Manager, PresentMon or `powercfg`.
+**Not run, so not claimed:** launching the app, the picker, the probe handshake on real hardware, Win2D rendering, DPI scaling, and every latency/CPU/GPU/battery number (CI runners have no interactive desktop or GPU). The app has in-panel counters (accepted fps, frame age from `SystemRelativeTime`, crop-copy time, draw submission time, process CPU, working set) for collecting those on a target machine. GPU engine time and battery drain need Task Manager, PresentMon or `powercfg`.
 
 ### Manual checklist for a Windows machine
 

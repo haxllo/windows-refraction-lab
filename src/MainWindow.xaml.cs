@@ -14,6 +14,7 @@ using Microsoft.Windows.System.Power;
 using RefractionLab.Capture;
 using RefractionLab.Logic;
 using System.Diagnostics;
+using System.Globalization;
 using System.Numerics;
 using Windows.Foundation;
 using Windows.Graphics;
@@ -35,7 +36,7 @@ public sealed partial class MainWindow : Window
     private readonly record struct Client(int Width, int Height, int ScreenX, int ScreenY);
 
     private const double PanelWidthDip = 700;   // Nex WINDOW_WIDTH
-    private const double PanelHeightDip = 410;
+    private const double PanelHeightDip = 456;
     private const double BezelDip = 32;
     private const double CornerDip = 8;
     private const double BlurDip = 3;
@@ -67,6 +68,9 @@ public sealed partial class MainWindow : Window
     private double _ddaCopyMs;
     private bool _ddaProtected;
     private double _ddaLockMs;
+    private StatsLogFile? _log;                // null unless "Log stats to file" was ticked when capture started
+    private string _logNote = string.Empty;
+    private int _maxFpsSetting = FramePacing.DefaultFps;
     private long _queuedAt;        // when the pending UI work item was queued; 0 = none
     private long _invalidatedAt;   // first Invalidate not yet drawn; 0 = none
 
@@ -307,6 +311,7 @@ public sealed partial class MainWindow : Window
             _pattern = ProbePattern.Create(Random.Shared);
             _padPx = (int)Math.Ceiling(BlurDip * _scale * 3) + 2;
             ResetStats();
+            OpenLogIfWanted("wgc");
 
             _throttle = new Throttle(TimeSpan.Zero, QueueDrain);
             _pool = Direct3D11CaptureFramePool.CreateFreeThreaded(
@@ -359,7 +364,7 @@ public sealed partial class MainWindow : Window
             Title = "Capture this display without a Windows border?",
             Content = "Desktop Duplication has no capture border or picker, so Windows will not show that this app is reading the screen. " +
                 "While it runs, this panel shows CAPTURE ACTIVE in red. Only the area behind the panel is copied, on the GPU; " +
-                "nothing is saved or sent. Capture stops when you press Stop, hide the panel, or after 10 minutes.",
+                "no screen content is saved or sent (the optional stats log holds numbers only). Capture stops when you press Stop, hide the panel, or after 10 minutes.",
             PrimaryButtonText = "Start capture",
             CloseButtonText = "Cancel",
             DefaultButton = ContentDialogButton.Close,
@@ -411,6 +416,7 @@ public sealed partial class MainWindow : Window
             _api = CaptureApi.Duplication;
             _displayHz = Native.GetRefreshRateHz(_hwnd);
             _borderNote = string.Empty;
+            OpenLogIfWanted("dxgi");
             _crop = new CanvasRenderTarget(GlassCanvas.Device, crop.Width, crop.Height, 96f);
             Native.SetWindowDisplayAffinity(_hwnd, Native.WdaNone); // step 1 needs the panel capturable
             _throttle = new Throttle(TimeSpan.Zero, QueueDuplicationWake);
@@ -663,6 +669,8 @@ public sealed partial class MainWindow : Window
         _mode = Mode.Refracting;
         if (_throttle is not null)
             _throttle.Interval = _minFrameInterval;
+        LogEvent("refracting", string.Create(CultureInfo.InvariantCulture,
+            $"probe_seen={_controlFraction:0.00} probe_clear={_clearFraction:0.00}"));
         string border = _borderNote.Length > 0 ? $"  ·  {_borderNote}" : string.Empty;
         SetStatus($"{source}  ·  exclusion verified (probe seen {_controlFraction:P0} → {_clearFraction:P0})  ·  only the panel crop is kept, in GPU memory{border}");
         ApplyModeUi();
@@ -825,8 +833,10 @@ public sealed partial class MainWindow : Window
         if (sender is not ComboBox { SelectedItem: ComboBoxItem { Tag: string tag } } || !int.TryParse(tag, out int fps))
             return;
         _minFrameInterval = FramePacing.MinInterval(fps);
+        _maxFpsSetting = fps;
         if (_mode == Mode.Refracting && _throttle is not null)
             _throttle.Interval = _minFrameInterval;
+        LogEvent("max_fps", FramePacing.Label(fps));
     }
 
     private void StopCapture(string status)
@@ -867,9 +877,11 @@ public sealed partial class MainWindow : Window
         _api = CaptureApi.None;
         Native.SetWindowDisplayAffinity(_hwnd, Native.WdaNone);
 
+        string logSuffix = CloseLog(status);
+
         if (_closing)
             return;
-        SetStatus(status);
+        SetStatus(status + logSuffix);
         MetricsText.Text = string.Empty;
         ApplyModeUi();
         GlassCanvas.Invalidate();
@@ -885,6 +897,7 @@ public sealed partial class MainWindow : Window
         StopButton.Visibility = _mode is Mode.Acrylic or Mode.Picking ? Visibility.Collapsed : Visibility.Visible;
         RefractionButton.IsEnabled = _mode == Mode.Acrylic;
         DuplicationButton.IsEnabled = _mode == Mode.Acrylic;
+        LogBox.IsEnabled = _mode == Mode.Acrylic;
         BendSlider.IsEnabled = _mode == Mode.Refracting;
 
         (string text, Color color) = _mode switch
@@ -910,6 +923,64 @@ public sealed partial class MainWindow : Window
         _rates = default;
         _lastDdaSource = 0;
         _fpsWindowStart = Stopwatch.GetTimestamp();
+    }
+
+    private void OpenLogIfWanted(string api)
+    {
+        _logNote = string.Empty;
+        if (LogBox.IsChecked != true)
+            return;
+
+        try
+        {
+            _log = StatsLogFile.Create(StatsLogFile.DefaultDirectory(), api, DateTimeOffset.Now);
+            LogEvent("start", string.Create(CultureInfo.InvariantCulture,
+                $"max_fps={FramePacing.Label(_maxFpsSetting)} display_hz={_displayHz} bend_pct={(int)Math.Round(BendSlider.Value)}"));
+        }
+        catch (Exception ex) when (StatsLogFile.IsIoFailure(ex))
+        {
+            _log = null;
+            _logNote = $"stats log unavailable ({ex.GetType().Name}); capture continues without it";
+        }
+    }
+
+    private void LogEvent(string name, string detail = "") =>
+        _log?.WriteEvent(detail.Length == 0 ? name : $"{name} {detail}");
+
+    private void WriteLogSample()
+    {
+        if (_log is null)
+            return;
+
+        bool dda = _api == CaptureApi.Duplication;
+        _log.WriteSample(new StatsSample(
+            dda ? "dxgi" : "wgc", FramePacing.Label(_maxFpsSetting), _displayHz, (int)Math.Round(BendSlider.Value),
+            _rates.Source, _rates.Used, _rates.Drawn, _ageMs, _copyMs, _drawMs,
+            _dispatchSummary, _renderSummary, dda ? Volatile.Read(ref _ddaLockMs) : (double?)null,
+            _cpuPct, Environment.WorkingSet / (1024 * 1024), Volatile.Read(ref _ddaProtected)));
+    }
+
+    private string LogStatusLine()
+    {
+        if (_log is null)
+            return _logNote.Length > 0 ? $"\n{_logNote}" : string.Empty;
+
+        return _log.Failure is null
+            ? $"\nlogging stats once per second to {_log.FilePath}"
+            : $"\nstats log stopped: {_log.Failure} ({_log.FilePath})";
+    }
+
+    // Returns text for the status line so the user can find the file after capture stops.
+    private string CloseLog(string reason)
+    {
+        if (_log is null)
+            return string.Empty;
+
+        _log.WriteEvent($"stop {reason}");
+        string path = _log.FilePath;
+        _log.Dispose();
+        _log = null;
+        return $" Stats log: {path}";
     }
 
     private void NoteDispatched()
@@ -945,12 +1016,15 @@ public sealed partial class MainWindow : Window
         _cpuSample = cpu;
         _cpuSampleStart = now;
 
+        if (_mode == Mode.Refracting)
+            WriteLogSample();
+
         string hz = _displayHz > 0 ? $"{_displayHz} Hz" : "? Hz";
         string lag = $"lag avg/max ms: ui queue {_dispatchSummary.AvgMs:0}/{_dispatchSummary.MaxMs:0} · invalidate→draw {_renderSummary.AvgMs:0}/{_renderSummary.MaxMs:0}" +
             (_api == CaptureApi.Duplication ? $" · device lock {Volatile.Read(ref _ddaLockMs):0.0}" : string.Empty);
         MetricsText.Text = _mode == Mode.Refracting
             ? $"{(_api == CaptureApi.Duplication ? "DXGI" : "WGC")} · per second: source {_rates.Source:0} → used {_rates.Used:0} → drawn {_rates.Drawn:0} (display {hz}) · age {_ageMs:0} ms · copy {_copyMs:0.0} ms · draw {_drawMs:0.0} ms · CPU {_cpuPct:0}% of 1 core · {Environment.WorkingSet / (1024 * 1024)} MB\n{lag}" +
-              (Volatile.Read(ref _ddaProtected) ? " · protected content is masked (black) on this display" : string.Empty)
+              (Volatile.Read(ref _ddaProtected) ? " · protected content is masked (black) on this display" : string.Empty) + LogStatusLine()
             : string.Empty;
     }
 

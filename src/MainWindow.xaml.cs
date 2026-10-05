@@ -68,6 +68,14 @@ public sealed partial class MainWindow : Window
     private double _ddaCopyMs;
     private bool _ddaProtected;
 
+    private string _borderNote = string.Empty;
+    private int _displayHz;
+    private GaussianBlurEffect? _blurFx;
+    private Transform2DEffect? _mapFx;
+    private DisplacementMapEffect? _displaceFx;
+    private CanvasGeometry? _clipGeometry;
+    private (CanvasBitmap?, CanvasBitmap?, float, float, float, float) _effectKey;
+
     private GraphicsCaptureItem? _item;
     private Direct3D11CaptureFramePool? _pool;
     private GraphicsCaptureSession? _session;
@@ -232,10 +240,44 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        BeginCapture(item);
+        bool hideBorder = await RequestBorderlessAsync();
+        if (_closing || _mode != Mode.Picking)
+            return;
+
+        BeginCapture(item, hideBorder);
     }
 
-    private void BeginCapture(GraphicsCaptureItem item)
+    // Windows shows its own consent prompt and decides; the border is only hidden if it reports Allowed.
+    private async Task<bool> RequestBorderlessAsync()
+    {
+        _borderNote = string.Empty;
+        if (BorderlessBox.IsChecked != true)
+            return false;
+
+        try
+        {
+            if (!Windows.Foundation.Metadata.ApiInformation.IsTypePresent("Windows.Graphics.Capture.GraphicsCaptureAccess"))
+            {
+                _borderNote = "this Windows build cannot hide the border; it stays";
+                return false;
+            }
+
+            var status = await GraphicsCaptureAccess.RequestAccessAsync(GraphicsCaptureAccessKind.Borderless);
+            if (status == Windows.Security.Authorization.AppCapabilityAccess.AppCapabilityAccessStatus.Allowed)
+            {
+                _borderNote = "Windows allowed hiding its border";
+                return true;
+            }
+            _borderNote = $"Windows answered {status}; the border stays";
+        }
+        catch (Exception ex)
+        {
+            _borderNote = $"border request failed (0x{ex.HResult:X8}); it stays";
+        }
+        return false;
+    }
+
+    private void BeginCapture(GraphicsCaptureItem item, bool hideBorder)
     {
         try
         {
@@ -255,6 +297,7 @@ public sealed partial class MainWindow : Window
             _item = item;
             _item.Closed += OnItemClosed;
             _api = CaptureApi.Wgc;
+            _displayHz = Native.GetRefreshRateHz(_hwnd);
             _pattern = ProbePattern.Create(Random.Shared);
             _padPx = (int)Math.Ceiling(BlurDip * _scale * 3) + 2;
             _acceptedFrames = 0;
@@ -263,7 +306,10 @@ public sealed partial class MainWindow : Window
                 GlassCanvas.Device, DirectXPixelFormat.B8G8R8A8UIntNormalized, FrameBuffers, item.Size);
             _pool.FrameArrived += OnFrameArrived;
             _session = _pool.CreateCaptureSession(item);
-            _session.IsCursorCaptureEnabled = false; // the system capture border stays at its default (required)
+            _session.IsCursorCaptureEnabled = false;
+            if (hideBorder && Windows.Foundation.Metadata.ApiInformation.IsPropertyPresent(
+                    "Windows.Graphics.Capture.GraphicsCaptureSession", "IsBorderRequired"))
+                _session.IsBorderRequired = false; // honored only because Windows reported Allowed above
             lock (_gate) { _accepting = true; }
 
             Native.SetWindowDisplayAffinity(_hwnd, Native.WdaNone); // step 1 needs the panel capturable
@@ -351,6 +397,8 @@ public sealed partial class MainWindow : Window
             _pattern = ProbePattern.Create(Random.Shared);
             _acceptedFrames = 0;
             _api = CaptureApi.Duplication;
+            _displayHz = Native.GetRefreshRateHz(_hwnd);
+            _borderNote = string.Empty;
             _crop = new CanvasRenderTarget(GlassCanvas.Device, crop.Width, crop.Height, 96f);
             Native.SetWindowDisplayAffinity(_hwnd, Native.WdaNone); // step 1 needs the panel capturable
             _dda = DuplicationSource.Start(
@@ -591,7 +639,8 @@ public sealed partial class MainWindow : Window
         _verifyTimer.Stop();
         _nudgeTimer.Stop();
         _mode = Mode.Refracting;
-        SetStatus($"{source}  ·  exclusion verified (probe seen {_controlFraction:P0} → {_clearFraction:P0})  ·  only the panel crop is kept, in GPU memory");
+        string border = _borderNote.Length > 0 ? $"  ·  {_borderNote}" : string.Empty;
+        SetStatus($"{source}  ·  exclusion verified (probe seen {_controlFraction:P0} → {_clearFraction:P0})  ·  only the panel crop is kept, in GPU memory{border}");
         ApplyModeUi();
     }
 
@@ -659,30 +708,45 @@ public sealed partial class MainWindow : Window
         float radius = (float)(CornerDip * _scale);
         float shift = (float)(BendSlider.Value / 100.0 * MaxShiftDip * _scale);
         EnsureBezelMap(sender.Device, (int)Math.Round(w), (int)Math.Round(h), radius, (float)(BezelDip * _scale));
+        EnsureEffects(sender, w, h, radius, (float)(BlurDip * _scale));
 
-        using CanvasGeometry clip = CanvasGeometry.CreateRoundedRectangle(sender, 0, 0, w, h, radius, radius);
-        using CanvasActiveLayer layer = ds.CreateLayer(1f, clip);
-        using var blur = new GaussianBlurEffect
+        _displaceFx!.Amount = 2 * shift; // map spans [-0.5, +0.5] of Amount, see BezelMap
+        using CanvasActiveLayer layer = ds.CreateLayer(1f, _clipGeometry!);
+        ds.DrawImage(_displaceFx, 0, 0, new Rect(_padPx, _padPx, w, h));
+        ds.FillRectangle(0, 0, w, h, Color.FromArgb(56, 12, 14, 20));
+    }
+
+    // Built once per size or source change, so the per-frame cost is the draw itself.
+    private void EnsureEffects(CanvasControl sender, float w, float h, float radius, float blurPx)
+    {
+        (CanvasBitmap?, CanvasBitmap?, float, float, float, float) key = (_crop, _bezelMap, w, h, radius, blurPx);
+        if (_displaceFx is not null && _effectKey == key)
+            return;
+
+        DisposeEffects();
+        _clipGeometry = CanvasGeometry.CreateRoundedRectangle(sender, 0, 0, w, h, radius, radius);
+        _blurFx = new GaussianBlurEffect { Source = _crop, BlurAmount = blurPx, BorderMode = EffectBorderMode.Hard };
+        _mapFx = new Transform2DEffect { Source = _bezelMap, TransformMatrix = Matrix3x2.CreateTranslation(_padPx, _padPx) };
+        _displaceFx = new DisplacementMapEffect
         {
-            Source = _crop,
-            BlurAmount = (float)(BlurDip * _scale),
-            BorderMode = EffectBorderMode.Hard,
-        };
-        using var map = new Transform2DEffect
-        {
-            Source = _bezelMap,
-            TransformMatrix = Matrix3x2.CreateTranslation(_padPx, _padPx),
-        };
-        using var displaced = new DisplacementMapEffect
-        {
-            Source = blur,
-            Displacement = map,
-            Amount = 2 * shift, // map spans [-0.5, +0.5] of Amount, see BezelMap
+            Source = _blurFx,
+            Displacement = _mapFx,
             XChannelSelect = EffectChannelSelect.Red,
             YChannelSelect = EffectChannelSelect.Green,
         };
-        ds.DrawImage(displaced, 0, 0, new Rect(_padPx, _padPx, w, h));
-        ds.FillRectangle(0, 0, w, h, Color.FromArgb(56, 12, 14, 20));
+        _effectKey = key;
+    }
+
+    private void DisposeEffects()
+    {
+        _displaceFx?.Dispose();
+        _mapFx?.Dispose();
+        _blurFx?.Dispose();
+        _clipGeometry?.Dispose();
+        _displaceFx = null;
+        _mapFx = null;
+        _blurFx = null;
+        _clipGeometry = null;
     }
 
     private void EnsureBezelMap(CanvasDevice device, int width, int height, float radius, float bezel)
@@ -766,6 +830,7 @@ public sealed partial class MainWindow : Window
         _dda = null;
         _crop?.Dispose();
         _crop = null;
+        DisposeEffects();
         _bezelMap?.Dispose();
         _bezelMap = null;
         _api = CaptureApi.None;
@@ -820,8 +885,9 @@ public sealed partial class MainWindow : Window
         _cpuSample = cpu;
         _cpuSampleStart = now;
 
+        string hz = _displayHz > 0 ? $"{_displayHz} Hz" : "? Hz";
         MetricsText.Text = _mode == Mode.Refracting
-            ? $"{(_api == CaptureApi.Duplication ? "DXGI" : "WGC")} · {_fps:0.0} fps · age {_ageMs:0} ms · copy {_copyMs:0.0} ms · draw {_drawMs:0.0} ms · CPU {_cpuPct:0}% · {_process.WorkingSet64 / (1024 * 1024)} MB" +
+            ? $"{(_api == CaptureApi.Duplication ? "DXGI" : "WGC")} · {_fps:0.0} fps (display {hz}) · age {_ageMs:0} ms · copy {_copyMs:0.0} ms · draw {_drawMs:0.0} ms · CPU {_cpuPct:0}% of 1 core · {Environment.WorkingSet / (1024 * 1024)} MB" +
               (Volatile.Read(ref _ddaProtected) ? " · protected content is masked (black) on this display" : string.Empty)
             : string.Empty;
     }

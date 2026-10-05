@@ -94,11 +94,14 @@
           <TextBlock Text="Bend" FontSize="11" Foreground="#FF9BA3B0" VerticalAlignment="Center" />
           <Slider x:Name="BendSlider" Width="130" Minimum="0" Maximum="100" Value="50" IsEnabled="False" VerticalAlignment="Center" ValueChanged="OnBendChanged" />
           <TextBlock Text="Max FPS" FontSize="11" Foreground="#FF9BA3B0" VerticalAlignment="Center" Margin="16,0,0,0" />
-          <ComboBox x:Name="FpsBox" Width="76" SelectedIndex="1" SelectionChanged="OnFpsChanged">
+          <ComboBox x:Name="FpsBox" Width="104" SelectedIndex="1" SelectionChanged="OnFpsChanged">
             <ComboBoxItem Content="15" Tag="15" />
             <ComboBoxItem Content="30" Tag="30" />
             <ComboBoxItem Content="60" Tag="60" />
+            <ComboBoxItem Content="Unlimited" Tag="0" />
           </ComboBox>
+          <CheckBox x:Name="BorderlessBox" Content="Ask Windows to hide border (B)" MinWidth="0" Margin="12,0,0,0" FontSize="11"
+                    ToolTipService.ToolTip="Mode B only. Windows shows its own consent prompt and decides; if it refuses, the border stays." />
         </StackPanel>
       </StackPanel>
 

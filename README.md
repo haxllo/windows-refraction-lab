@@ -29,8 +29,9 @@ Logic tests (any OS): `dotnet test .\tests\RefractionLab.Tests\RefractionLab.Tes
 
 1. The panel opens centered (700 DIP wide, as in Nex) on Acrylic. Capture is off.
 2. **B:** click it, then choose **the display that shows the panel** in the Windows picker. Cancelling, picking a window, or picking another display leaves Acrylic active. **C:** click it and confirm the dialog; the display is found automatically.
-3. A two-step check runs for about a second (see below). On success the badge reads **CAPTURE ACTIVE** (B also shows Windows' capture border; C adds **NO WINDOWS BORDER**). Drag **Bend** to change rim strength and use **Max FPS** (15, 30 or 60) to trade smoothness for GPU use.
-4. **Stop capture**, **A Acrylic only**, hiding the panel, **Esc** (closes the app), or turning on Energy Saver all stop capture and release every capture resource. C also stops after 10 minutes.
+3. A two-step check runs for about a second (see below). On success the badge reads **CAPTURE ACTIVE** (B also shows Windows' capture border; C adds **NO WINDOWS BORDER**). Drag **Bend** to change rim strength and use **Max FPS** (15, 30, 60 or Unlimited) to trade smoothness for GPU use. The stats line shows the achieved fps next to your display's refresh rate; capture cannot usefully exceed that rate.
+4. Optional, mode B only: tick **Ask Windows to hide border (B)** before starting. Windows shows its own consent prompt and decides; the status line reports its answer, and the border stays unless Windows says Allowed.
+5. **Stop capture**, **A Acrylic only**, hiding the panel, **Esc** (closes the app), or turning on Energy Saver all stop capture and release every capture resource. C also stops after 10 minutes.
 
 Put something busy behind the panel (Settings → Personalization → Background slideshow, a video, a window with text) and switch A/B.
 
@@ -50,7 +51,8 @@ Yes. It is not available from Windows' own Acrylic, so an app has to capture and
 
 - **Others do this today.** From their READMEs only (I have not run them or checked their performance claims): `electron-liquid-glass` uses Desktop Duplication, D3D11 shaders and DirectComposition, excludes its own window with `WDA_EXCLUDEFROMCAPTURE`, and drops DWM "echo" updates; `liquidDX11` uses DXGI capture with HLSL refraction; `liquid-glass-WinUI` uses a Win2D displacement chain.
 - **The border is a policy choice, not a bug.** Mode C removes the only OS-level signal that the screen is being read, so this prototype adds a confirmation dialog, a persistent red badge, a 10-minute auto-stop and the same self-exclusion check. Whether that is acceptable for a shipped launcher is a product decision. The OS-approved borderless route needs a packaged (MSIX) app; the Nex repo has an Inno Setup script (`scripts/windows/nex.iss`) and I saw no MSIX packaging.
-- **Low fps in the first build was my cap.** It limited processing to 12 fps to keep GPU and battery cost down. That was a conservative choice, not a platform limit. The default is now 30 fps with a 15/30/60 selector.
+- **Low fps in the first build was my cap.** It limited processing to 12 fps to keep GPU and battery cost down. That was a conservative choice, not a platform limit. The default is now 30 fps. The second build's top option was labelled "60" but actually meant uncapped; it is now a real 60 cap, and **Unlimited** is its own option. Capture rate is bounded by content changes and the display's refresh rate (the Microsoft sample maintainer: capture "will go up to the refresh rate", [GitHub issue #142](https://github.com/microsoft/Windows.UI.Composition-Win32-Samples/issues/142)), so on a 60 Hz display about 60 is the ceiling. The stats line now shows the display's refresh rate to make that visible.
+- **Borderless on B is an experiment.** Microsoft documents the opt-out as `GraphicsCaptureAccess.RequestAccessAsync(Borderless)` plus a `graphicsCaptureWithoutBorder` capability in a package manifest. This app is unpackaged, so the checkbox simply asks and reports Windows' answer; whether an unpackaged app can be allowed is exactly what it tests.
 - **Known risk for C:** on Windows 11 24H2 with multiplane overlay, an excluded window's own redraws can wake Desktop Duplication ([Win32CaptureSample#83](https://github.com/robmikh/Win32CaptureSample/issues/83)). Here that could make the panel re-trigger itself on a static desktop. The in-panel fps counter shows it: if fps stays near the cap with nothing moving, that loop exists.
 
 ## Architecture and API rationale
@@ -80,7 +82,7 @@ Only the grid's pixels are read back; the rest of the frame stays in the OS-owne
 
 - Capture only starts after an explicit click (B: and a picker choice; C: and a confirmation dialog); nothing is saved, streamed, logged or sent. Metrics are shown in the panel only.
 - Retained: one panel-sized GPU image (plus a few px for blur), replaced each frame. B: the OS holds full-display frame buffers because Windows Graphics Capture has no sub-rectangle target. C: the full desktop image exists only while each frame is acquired; just the panel rectangle is copied out.
-- Max FPS (default 30, options 15/30/60) is a trailing-edge throttle, so the last change is never dropped. Capture stops on hide, Energy Saver, device reset, display-size change, or display removal.
+- Max FPS (default 30, options 15/30/60/Unlimited) is a trailing-edge throttle, so the last change is never dropped. Capped values wait on a UI-thread timer, so the achieved rate can land below the cap (not measured); Unlimited skips the wait. Capture stops on hide, Energy Saver, device reset, display-size change, or display removal.
 - While refraction is active this window is also hidden from other screenshots and recorders (that is what the exclusion does).
 
 ## Verification
@@ -89,7 +91,7 @@ Only the grid's pixels are read back; the rest of the frame stays in the OS-owne
 
 | Check | Result |
 |---|---|
-| Logic unit tests (`ProbePattern`, `CropMath`, `BezelMap`, `FramePacing`) | 47 passed. For the original 31, three deliberate mutations (matcher always matches, bezel pointing outward, ignoring monitor origin) each made tests fail. |
+| Logic unit tests (`ProbePattern`, `CropMath`, `BezelMap`, `FramePacing`) | 49 passed. For the original 31, three deliberate mutations (matcher always matches, bezel pointing outward, ignoring monitor origin) each made tests fail. |
 | Package restore | Passes. The committed project previously failed with NU1605 (an explicit `Microsoft.Windows.SDK.BuildTools` pin below the version Windows App SDK requires); the pin was removed. |
 | C# type-check of `src/` against Windows App SDK 1.8.260804001, Win2D 1.4.0, Vortice 3.8.3 and the Windows SDK projections | 0 errors. XAML-generated members were stubbed; injected errors were caught, and it found two real mistakes in the new mode C code before commit. This is a compile check only: the XAML compiler and `makepri.exe` are Windows-only executables, so it could not see XAML errors. |
 | Windows build in CI (`windows-latest`): `dotnet build` and self-contained `dotnet publish`, `RefractionLab.exe` present | Passes. The first run failed with a XAML parse error (WMC9997: `--` inside an XML comment) that the Linux type-check could not detect; fixed. This proves the project compiles and packages, not that it runs. |
@@ -97,14 +99,16 @@ Only the grid's pixels are read back; the rest of the frame stays in the OS-owne
 
 Mode C compiles and builds but has **never been run**: the D3D11 interop, `WDA_EXCLUDEFROMCAPTURE` with Desktop Duplication, and the dirty-rectangle filter are unverified. The Windows interop IID it uses was confirmed only by finding its bytes in Win2D's native DLLs.
 
-**Not run, so not claimed:** mode C on any machine, the probe handshake on real hardware for either mode, DPI scaling, and every latency/CPU/GPU/battery number (CI runners have no interactive desktop or GPU). The app has in-panel counters (accepted fps, frame age from `SystemRelativeTime`, crop-copy time, draw submission time, process CPU, working set) for collecting those on a target machine. GPU engine time and battery drain need Task Manager, PresentMon or `powercfg`.
+**User-reported, one run (not independently verified; hardware and refresh rate not recorded):** mode B with a video playing reached about 40 fps, frame age 0 ms, crop copy 0.3 ms, 12-30% CPU of one core and 139 MB. That RAM figure came from a build that read `Process.WorkingSet64` without refreshing it, so it may have been a stale first reading; the app now uses `Environment.WorkingSet`. The same build rebuilt the blur and displacement effect graph on every frame; it is now built once per size change. How much CPU that saves has not been measured.
+
+**Not run, so not claimed:** mode C on any machine, the probe handshake on real hardware for either mode, DPI scaling, the borderless request outcome, and every GPU and battery number (CI runners have no interactive desktop or GPU). The app has in-panel counters (accepted fps, frame age from `SystemRelativeTime`, crop-copy time, draw submission time, process CPU, working set) for collecting those on a target machine. GPU engine time and battery drain need Task Manager, PresentMon or `powercfg`.
 
 ### Manual checklist for a Windows machine
 
 1. A works with no capture and no border. Toggle Windows transparency effects and Battery Saver: the panel should fall back to a solid color, not break.
 2. B on the correct display ends in **CAPTURE ACTIVE** with the capture border visible. Repeat with: cancel, a window picked, and the wrong display (needs two monitors). Each must end on Acrylic with a message.
 3. While active, take a screenshot: the panel should be absent from it. Press Stop: border disappears and the panel is capturable again.
-4. Static wallpaper, then a video or slideshow behind the panel, for B and C at 15/30/60: static should show ~0 fps and idle CPU; moving content should approach the chosen rate. For C, a static desktop that still shows fps near the cap is the 24H2 self-trigger loop. Record the counters and Task Manager GPU/Power columns.
+4. Static wallpaper, then a video or slideshow behind the panel, for B and C at 15/30/60/Unlimited: static should show ~0 fps and idle CPU; moving content should approach the chosen rate, never above the displayed refresh rate. If Unlimited stays well below the display rate while content is moving, note the display rate and the fps; on Windows 11 24H2 the next thing to try would be `GraphicsCaptureSession.MinUpdateInterval` (not used yet). For C, a static desktop that still shows fps near the cap is the 24H2 self-trigger loop. Record the counters and Task Manager GPU/Power columns.
 5. Play protected video behind the panel: it must stay black/blank, with no alternate capture path.
 6. Change display scale (100/125/150/200%), unplug/switch the display, lock/unlock, trigger a UAC prompt, and sleep/resume while capture is active. Each should end on Acrylic or keep working; none should leave the border stuck on (B) or capture running unnoticed (C).
 
@@ -113,6 +117,7 @@ Mode C compiles and builds but has **never been run**: the D3D11 interop, `WDA_E
 - **Unvalidated on hardware.** The riskiest assumptions: that the capture stream delivers a fresh frame when exclusion removes the panel (if not, the handshake times out and the app refuses; it fails safe but refraction would never start), that `WDA_EXCLUDEFROMCAPTURE` is honored by Desktop Duplication, that Win2D's D3D11 device can be shared with a second thread under its device lock, that `CanvasControl.DpiScale` normalizes to 96 DPI (otherwise the app refuses), and that `DisplacementMapEffect.Amount` is in pixels at 96 DPI.
 - **Mode C specifics.** One GPU only: if the panel's display is on another adapter than Win2D's, it refuses. Rotated displays are refused. A UAC prompt, lock screen or mode change ends capture (`ACCESS_LOST`) and returns to Acrylic rather than reconnecting. No echo-rectangle filtering beyond the panel-rectangle test, so the 24H2 self-trigger risk above is open.
 - Whole-display capture only; the picker must be used every launch. The system capture border is part of the effect at display edges.
+- Mode B processes every frame Windows delivers for the whole display, including changes far from the panel (it has no dirty-region filter; mode C does). A video elsewhere on screen therefore costs work even though the panel is unaffected.
 - Fixed panel position is assumed. Moving the panel produces no capture frame (the panel is excluded), so the refraction would be stale until the content behind changes. The panel must also be ≥ blur-pad pixels from the display edges.
 - Protected content and genuinely black wallpapers look the same (black); the app shows what Windows supplies and does not try another capture API.
 - HDR/WCG output, multi-GPU laptops, device loss recovery, and per-monitor DPI moves are untested. The probe's color match may fail under HDR tone mapping, which fails safe to Acrylic.

@@ -11,6 +11,14 @@
         IsHitTestVisible="False"
         Draw="OnGlassDraw" />
 
+    <!-- Filled only by the optional render thread; opaque, because a WinUI 3 SwapChainPanel cannot be transparent. -->
+    <canvas:CanvasSwapChainPanel
+        x:Name="SwapPanel"
+        Visibility="Collapsed"
+        HorizontalAlignment="Left"
+        VerticalAlignment="Top"
+        IsHitTestVisible="False" />
+
     <!-- Nex acrylic tokens: panel-surface rgba(17,20,27,.12), panel-edge rgba(255,255,255,.2), radius 8px -->
     <Border
         x:Name="GlassTint"
@@ -106,6 +114,8 @@
                     ToolTipService.ToolTip="Mode B only. Windows shows its own consent prompt and decides; if it refuses, the border stays." />
           <CheckBox x:Name="LogBox" Content="Log stats to file" MinWidth="0" FontSize="11"
                     ToolTipService.ToolTip="Off by default. While capture runs, writes one CSV row per second of the numbers shown here (no screen content) to %LOCALAPPDATA%\RefractionLab\logs." />
+          <CheckBox x:Name="ThreadedBox" Content="Render off the UI thread (C)" MinWidth="0" FontSize="11"
+                    ToolTipService.ToolTip="Experimental, mode C only. Draws and presents on a separate thread so UI-thread delays cannot slow the refraction. The panel becomes fully opaque while it runs. Untick to compare with the normal renderer." />
         </StackPanel>
       </StackPanel>
 

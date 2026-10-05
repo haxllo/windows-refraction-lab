@@ -5,6 +5,8 @@ namespace RefractionLab.Tests;
 
 public class ThrottleGateTests
 {
+    private const double WindowsTickMs = 15.625; // default system timer resolution
+
     private static TimeSpan Ms(double ms) => TimeSpan.FromMilliseconds(ms);
 
     private static ThrottleGate Gate(double intervalMs) => new() { Interval = Ms(intervalMs) };
@@ -101,44 +103,60 @@ public class ThrottleGateTests
         Assert.Equal(TimeSpan.Zero, gate.Interval);
     }
 
-    // Drives a gate with a fixed-rate source and an ideal timer, returning how many times it fired.
-    private static int Simulate(double sourceHz, double capHz, double seconds, out double lastFireMs, out double lastSignalMs, out int signals)
+    [Fact]
+    public void AfterALongIdleThereIsNoBurstOfCatchUpFires()
+    {
+        ThrottleGate gate = Gate(16.7);
+        gate.Signal(Ms(0), out _);
+        Assert.Equal(ThrottleAction.Fire, gate.Signal(Ms(5000), out _));
+        Assert.Equal(ThrottleAction.Arm, gate.Signal(Ms(5003), out _));
+    }
+
+    // Drives a gate with a fixed-rate source and a timer that, like Windows', can only fire on tick boundaries.
+    // timerTickMs = 0 models a perfect timer.
+    private static int Simulate(
+        double sourceHz, double capHz, double seconds,
+        out double lastFireMs, out double lastSignalMs, out int signals, double timerTickMs = 0)
     {
         ThrottleGate gate = Gate(capHz <= 0 ? 0 : 1000.0 / capHz);
         double step = 1000.0 / sourceHz, timerAt = double.MaxValue;
-        int fires = 0;
-        signals = 0;
-        lastFireMs = lastSignalMs = 0;
+        int fires = 0, count = (int)Math.Round(sourceHz * seconds), sigCount = 0;
+        double lastFire = 0, lastSignal = 0;
 
-        int count = (int)Math.Round(sourceHz * seconds);
-        for (int i = 0; i < count; i++)
+        double ArmAt(double now, TimeSpan armFor)
         {
-            double t = i * step;
-            // an armed timer that elapses before the next signal runs first
-            while (timerAt <= t)
-            {
-                double now = timerAt;
-                timerAt = double.MaxValue;
-                ThrottleAction a = gate.Tick(Ms(now), out TimeSpan armFor);
-                if (a == ThrottleAction.Fire) { fires++; lastFireMs = now; }
-                else if (a == ThrottleAction.Arm) timerAt = now + armFor.TotalMilliseconds;
-            }
-
-            ThrottleAction action = gate.Signal(Ms(t), out TimeSpan arm);
-            signals++;
-            lastSignalMs = t;
-            if (action == ThrottleAction.Fire) { fires++; lastFireMs = t; }
-            else if (action == ThrottleAction.Arm) timerAt = t + arm.TotalMilliseconds;
+            double due = now + armFor.TotalMilliseconds;
+            return timerTickMs <= 0 ? due : Math.Ceiling(due / timerTickMs) * timerTickMs;
         }
 
-        while (timerAt != double.MaxValue)
+        void RunTimer()
         {
             double now = timerAt;
             timerAt = double.MaxValue;
             ThrottleAction a = gate.Tick(Ms(now), out TimeSpan armFor);
-            if (a == ThrottleAction.Fire) { fires++; lastFireMs = now; }
-            else if (a == ThrottleAction.Arm) timerAt = now + armFor.TotalMilliseconds;
+            if (a == ThrottleAction.Fire) { fires++; lastFire = now; }
+            else if (a == ThrottleAction.Arm) timerAt = ArmAt(now, armFor);
         }
+
+        for (int i = 0; i < count; i++)
+        {
+            double t = i * step;
+            while (timerAt <= t)
+                RunTimer();
+
+            ThrottleAction action = gate.Signal(Ms(t), out TimeSpan arm);
+            sigCount++;
+            lastSignal = t;
+            if (action == ThrottleAction.Fire) { fires++; lastFire = t; }
+            else if (action == ThrottleAction.Arm) timerAt = ArmAt(t, arm);
+        }
+
+        while (timerAt != double.MaxValue)
+            RunTimer();
+
+        lastFireMs = lastFire;
+        lastSignalMs = lastSignal;
+        signals = sigCount;
         return fires;
     }
 
@@ -164,10 +182,40 @@ public class ThrottleGateTests
         Assert.Equal(signals, fires);
     }
 
+    // Regression: with a source only a little faster than the cap, an armed timer that overshoots
+    // used to lose the race to the next frame, so every second frame was dropped (~35 fps at 70 Hz / 60).
+    [Theory]
+    [InlineData(70, 60)]
+    [InlineData(79, 60)]
+    [InlineData(100, 60)]
+    [InlineData(90, 30)]
+    [InlineData(144, 60)]
+    public void SourceJustAboveTheCapStillReachesTheCapWithACoarseTimer(double sourceHz, double capHz)
+    {
+        int fires = Simulate(sourceHz, capHz, 10, out _, out _, out _, WindowsTickMs);
+        Assert.InRange(fires / 10.0, capHz * 0.92, capHz * 1.03);
+    }
+
+    [Theory]
+    [InlineData(70, 60)]
+    [InlineData(144, 30)]
+    public void ACoarseTimerNeverLetsTheRateExceedTheCap(double sourceHz, double capHz)
+    {
+        int fires = Simulate(sourceHz, capHz, 10, out _, out _, out _, WindowsTickMs);
+        Assert.True(fires / 10.0 <= capHz * 1.03, $"{fires / 10.0} fps exceeds the {capHz} cap");
+    }
+
     [Fact]
     public void TheLastChangeIsAlwaysDeliveredEventually()
     {
         Simulate(240, 30, 2, out double lastFire, out double lastSignal, out _);
+        Assert.True(lastFire >= lastSignal, $"last fire {lastFire} ms is before the last signal {lastSignal} ms");
+    }
+
+    [Fact]
+    public void TheLastChangeIsDeliveredEvenWithACoarseTimer()
+    {
+        Simulate(70, 30, 2, out double lastFire, out double lastSignal, out _, WindowsTickMs);
         Assert.True(lastFire >= lastSignal, $"last fire {lastFire} ms is before the last signal {lastSignal} ms");
     }
 }

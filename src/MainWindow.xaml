@@ -111,7 +111,7 @@
           <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
         <TextBlock x:Name="StatusText" Text="Acrylic baseline  ·  desktop capture is off" FontSize="10" Foreground="#FFAEB6C2" TextWrapping="Wrap" MaxLines="2" />
-        <TextBlock x:Name="MetricsText" Grid.Row="1" FontSize="9" Foreground="#FF8E95A1" Margin="0,3,0,0" />
+        <TextBlock x:Name="MetricsText" Grid.Row="1" FontSize="9" Foreground="#FF8E95A1" Margin="0,3,0,0" TextWrapping="Wrap" />
       </Grid>
     </Grid>
   </Grid>

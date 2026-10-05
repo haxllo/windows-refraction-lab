@@ -12,7 +12,7 @@ using DxgiResultCode = Vortice.DXGI.ResultCode;
 
 namespace RefractionLab.Capture;
 
-internal readonly record struct DuplicationFrame(long PresentTicks, double CopyMs, bool ProtectedMasked);
+internal readonly record struct DuplicationFrame(long PresentTicks, double CopyMs, bool ProtectedMasked, double LockMs);
 
 /// <summary>
 /// DXGI Desktop Duplication of one display. A worker thread copies only the panel rectangle,
@@ -154,13 +154,17 @@ internal sealed class DuplicationSource : IDisposable
                     first = false;
 
                     long copyStart = Stopwatch.GetTimestamp();
+                    double lockMs;
                     using (ID3D11Texture2D desktop = resource.QueryInterface<ID3D11Texture2D>())
                     using (_canvasDevice.Lock())
+                    {
+                        lockMs = Stopwatch.GetElapsedTime(copyStart).TotalMilliseconds; // time spent waiting for the UI thread's drawing
                         _context.CopySubresourceRegion(_cropTexture, 0, 0, 0, 0, desktop, 0, _srcBox);
+                    }
 
                     long presentTicks = (long)(info.LastPresentTime * (TimeSpan.TicksPerSecond / (double)Stopwatch.Frequency));
                     _onFrame(new DuplicationFrame(
-                        presentTicks, Stopwatch.GetElapsedTime(copyStart).TotalMilliseconds, info.ProtectedContentMaskedOut));
+                        presentTicks, Stopwatch.GetElapsedTime(copyStart).TotalMilliseconds, info.ProtectedContentMaskedOut, lockMs));
                 }
                 finally
                 {

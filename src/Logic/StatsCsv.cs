@@ -4,6 +4,8 @@ using System.Text;
 namespace RefractionLab.Logic;
 
 /// <summary>One second of the numbers the panel already shows. Contains no screen content or window details.</summary>
+public readonly record struct RenderTiming(double PaintAvgMs, double BlitAvgMs, double PresentAvgMs, double TotalMaxMs);
+
 public readonly record struct StatsSample(
     string Api,
     string MaxFps,
@@ -20,7 +22,8 @@ public readonly record struct StatsSample(
     double? DeviceLockMs,
     double CpuPct,
     long WorkingSetMb,
-    bool ProtectedMasked);
+    bool ProtectedMasked,
+    RenderTiming? Render = null);
 
 /// <summary>
 /// CSV formatting for the stats log. Always invariant-culture and ASCII, so the file reads the same
@@ -31,7 +34,8 @@ public static class StatsCsv
     public const string Header =
         "utc,elapsed_s,api,max_fps,display_hz,bend_pct,source_per_s,used_per_s,drawn_per_s," +
         "age_ms,copy_ms,draw_ms,ui_queue_avg_ms,ui_queue_max_ms,invalidate_draw_avg_ms,invalidate_draw_max_ms," +
-        "device_lock_ms,cpu_pct_of_1_core,working_set_mb,protected_masked,event";
+        "device_lock_ms,cpu_pct_of_1_core,working_set_mb,protected_masked," +
+        "render_paint_avg_ms,render_blit_avg_ms,render_present_avg_ms,render_total_max_ms,event";
 
     public static int ColumnCount { get; } = Header.Split(',').Length;
 
@@ -58,7 +62,11 @@ public static class StatsCsv
         f[17] = Num(s.CpuPct, "0.0");
         f[18] = s.WorkingSetMb.ToString(CultureInfo.InvariantCulture);
         f[19] = s.ProtectedMasked ? "1" : "0";
-        f[20] = string.Empty;
+        f[20] = s.Render is { } r ? Num(r.PaintAvgMs, "0.0") : string.Empty;
+        f[21] = s.Render is { } r2 ? Num(r2.BlitAvgMs, "0.0") : string.Empty;
+        f[22] = s.Render is { } r3 ? Num(r3.PresentAvgMs, "0.0") : string.Empty;
+        f[23] = s.Render is { } r4 ? Num(r4.TotalMaxMs, "0.0") : string.Empty;
+        f[24] = string.Empty;
         return string.Join(',', f);
     }
 

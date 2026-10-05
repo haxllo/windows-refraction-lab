@@ -9,11 +9,11 @@ public class StatsCsvTests
 {
     private static readonly DateTimeOffset At = new(2026, 10, 5, 3, 7, 31, 481, TimeSpan.Zero);
 
-    private static StatsSample Sample(double? deviceLock = 0.4, int displayHz = 79, string api = "dxgi") => new(
+    private static StatsSample Sample(double? deviceLock = 0.4, int displayHz = 79, string api = "dxgi", RenderTiming? render = null) => new(
         api, "60", displayHz, 50,
         69.8, 20.2, 19.9, 3, 0.31, 1.25,
         new LatencySummary(1.4, 12.9, 20), new LatencySummary(2.2, 15.0, 20),
-        deviceLock, 17.5, 139, false);
+        deviceLock, 17.5, 139, false, render);
 
     // Minimal RFC 4180 field splitter, enough to prove escaping round-trips.
     internal static List<string> Split(string line)
@@ -41,7 +41,7 @@ public class StatsCsvTests
     [Fact]
     public void HeaderRowsAndEventsAllHaveTheSameColumnCount()
     {
-        Assert.Equal(21, StatsCsv.ColumnCount);
+        Assert.Equal(25, StatsCsv.ColumnCount);
         Assert.Equal(StatsCsv.ColumnCount, Split(StatsCsv.Header).Count);
         Assert.Equal(StatsCsv.ColumnCount, Split(StatsCsv.Row(At, 12.3, Sample())).Count);
         Assert.Equal(StatsCsv.ColumnCount, Split(StatsCsv.Event(At, 0, "dxgi", "start max_fps=60")).Count);
@@ -74,7 +74,33 @@ public class StatsCsvTests
         Assert.Equal("17.5", V("cpu_pct_of_1_core"));
         Assert.Equal("139", V("working_set_mb"));
         Assert.Equal("0", V("protected_masked"));
+        Assert.Equal("", V("render_paint_avg_ms"));       // not the render-thread path
+        Assert.Equal("", V("render_total_max_ms"));
         Assert.Equal("", V("event"));
+    }
+
+    [Fact]
+    public void RenderThreadTimingsLandInTheirOwnColumns()
+    {
+        string[] names = Split(StatsCsv.Header).ToArray();
+        string[] values = Split(StatsCsv.Row(At, 3, Sample(render: new RenderTiming(24.31, 9.84, 0.46, 178.15)))).ToArray();
+        string V(string column) => values[Array.IndexOf(names, column)];
+
+        Assert.Equal(StatsCsv.ColumnCount, values.Length);
+        Assert.Equal("24.3", V("render_paint_avg_ms"));
+        Assert.Equal("9.8", V("render_blit_avg_ms"));
+        Assert.Equal("0.5", V("render_present_avg_ms"));
+        Assert.Equal("178.2", V("render_total_max_ms"));
+        Assert.Equal("", V("event"));
+        Assert.Equal("0", V("protected_masked"));          // neighbours are undisturbed
+    }
+
+    [Fact]
+    public void TheEventColumnStaysLast()
+    {
+        string[] names = Split(StatsCsv.Header).ToArray();
+        Assert.Equal("event", names[^1]);
+        Assert.Equal(names.Length - 1, Array.IndexOf(names, "event"));
     }
 
     [Fact]

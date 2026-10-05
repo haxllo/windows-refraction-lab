@@ -10,6 +10,19 @@ public static class CropMath
     public static PxRect Inflate(PxRect rect, int pad) =>
         new(rect.X - pad, rect.Y - pad, rect.Width + pad * 2, rect.Height + pad * 2);
 
+    public static bool Intersects(PxRect a, PxRect b) =>
+        a.Width > 0 && a.Height > 0 && b.Width > 0 && b.Height > 0 &&
+        a.X < b.X + b.Width && b.X < a.X + a.Width &&
+        a.Y < b.Y + b.Height && b.Y < a.Y + a.Height;
+
+    public static bool AnyIntersects(ReadOnlySpan<PxRect> rects, PxRect crop)
+    {
+        foreach (PxRect rect in rects)
+            if (Intersects(rect, crop))
+                return true;
+        return false;
+    }
+
     /// <summary>Probe grid location inside the panel's client area (top-right), in physical pixels.</summary>
     public static PxRect ProbeRect(int clientWidth, double scale, out int cellPx)
     {

@@ -1,6 +1,7 @@
 using Microsoft.Graphics.Canvas;
 using Microsoft.Graphics.Canvas.Effects;
 using Microsoft.Graphics.Canvas.Geometry;
+using Microsoft.Graphics.Canvas.UI;
 using Microsoft.Graphics.Canvas.UI.Xaml;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Windowing;
@@ -10,6 +11,7 @@ using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.Windows.System.Power;
+using RefractionLab.Capture;
 using RefractionLab.Logic;
 using System.Diagnostics;
 using System.Numerics;
@@ -28,23 +30,28 @@ public sealed partial class MainWindow : Window
     // self-exclusion handshake. Refracting = verified; frames are cropped and displaced.
     private enum Mode { Acrylic, Picking, ProbeVisible, ProbeExcluded, Refracting }
 
+    private enum CaptureApi { None, Wgc, Duplication }
+
     private readonly record struct Client(int Width, int Height, int ScreenX, int ScreenY);
 
     private const double PanelWidthDip = 700;   // Nex WINDOW_WIDTH
-    private const double PanelHeightDip = 360;
+    private const double PanelHeightDip = 396;
     private const double BezelDip = 32;
     private const double CornerDip = 8;
     private const double BlurDip = 3;
     private const double MaxShiftDip = 28;
     private const int FrameBuffers = 3;
     private const long ExclusionSettleTicks = 150 * TimeSpan.TicksPerMillisecond;
-    private static readonly TimeSpan MinFrameInterval = TimeSpan.FromMilliseconds(83); // ~12 fps ceiling
+    private static readonly TimeSpan AutoStopAfter = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan NudgeInterval = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan VerifyTimeout = TimeSpan.FromSeconds(4);
 
     private readonly DispatcherQueue _dispatcher;
     private readonly DispatcherQueueTimer _verifyTimer;
     private readonly DispatcherQueueTimer _drainTimer;
     private readonly DispatcherQueueTimer _metricsTimer;
+    private readonly DispatcherQueueTimer _nudgeTimer;
+    private readonly DispatcherQueueTimer _autoStopTimer;
     private readonly Process _process = Process.GetCurrentProcess();
     private readonly object _gate = new();
     private readonly IntPtr _hwnd;
@@ -52,6 +59,14 @@ public sealed partial class MainWindow : Window
     private Mode _mode = Mode.Acrylic;
     private double _scale = 1;
     private bool _closing;
+    private CaptureApi _api = CaptureApi.None;
+    private TimeSpan _minFrameInterval = FramePacing.MinInterval(FramePacing.DefaultFps);
+
+    private DuplicationSource? _dda;
+    private int _ddaWake;                   // 1 while a UI wake-up is queued
+    private long _ddaPresentTicks;
+    private double _ddaCopyMs;
+    private bool _ddaProtected;
 
     private GraphicsCaptureItem? _item;
     private Direct3D11CaptureFramePool? _pool;
@@ -82,8 +97,10 @@ public sealed partial class MainWindow : Window
         _dispatcher = DispatcherQueue;
         _hwnd = WindowNative.GetWindowHandle(this);
         _verifyTimer = MakeTimer(VerifyTimeout, false, OnVerifyTimeout);
-        _drainTimer = MakeTimer(MinFrameInterval, false, Drain);
+        _drainTimer = MakeTimer(_minFrameInterval, false, Drain);
         _metricsTimer = MakeTimer(TimeSpan.FromSeconds(1), true, OnMetricsTick);
+        _nudgeTimer = MakeTimer(NudgeInterval, true, OnNudge);
+        _autoStopTimer = MakeTimer(AutoStopAfter, false, () => StopCapture("Auto-stopped after 10 minutes; Acrylic restored."));
         _cpuSample = _process.TotalProcessorTime;
 
         try { SystemBackdrop = new DesktopAcrylicBackdrop(); }
@@ -92,7 +109,11 @@ public sealed partial class MainWindow : Window
         ConfigureWindow();
         RootGrid.Loaded += OnLoaded;
         RootGrid.KeyDown += OnKeyDown;
-        GlassCanvas.CreateResources += (_, _) => { if (_mode != Mode.Acrylic) StopCapture("Graphics device was reset; Acrylic restored."); };
+        GlassCanvas.CreateResources += (_, e) =>
+        {
+            if (e.Reason == CanvasCreateResourcesReason.NewDevice && _mode != Mode.Acrylic)
+                StopCapture("Graphics device was reset; Acrylic restored.");
+        };
         AppWindow.Changed += OnAppWindowChanged;
         PowerManager.EnergySaverStatusChanged += OnEnergySaverChanged;
         Closed += OnClosed;
@@ -153,6 +174,8 @@ public sealed partial class MainWindow : Window
     {
         if (args.DidVisibilityChange && !sender.IsVisible && _mode != Mode.Acrylic)
             StopCapture("Panel hidden; capture stopped.");
+        else if (args.DidSizeChange && _api == CaptureApi.Duplication && _mode != Mode.Acrylic)
+            StopCapture("Panel was resized; capture stopped.");
     }
 
     private void OnEnergySaverChanged(object? sender, object args) =>
@@ -231,6 +254,7 @@ public sealed partial class MainWindow : Window
 
             _item = item;
             _item.Closed += OnItemClosed;
+            _api = CaptureApi.Wgc;
             _pattern = ProbePattern.Create(Random.Shared);
             _padPx = (int)Math.Ceiling(BlurDip * _scale * 3) + 2;
             _acceptedFrames = 0;
@@ -247,6 +271,7 @@ public sealed partial class MainWindow : Window
             ApplyModeUi();
             SetStatus("Step 1/2: confirming this panel is visible in the capture…");
             _verifyTimer.Start();
+            _nudgeTimer.Start();
             _metricsTimer.Start();
             _session.StartCapture();
             GlassCanvas.Invalidate();
@@ -255,6 +280,183 @@ public sealed partial class MainWindow : Window
         {
             StopCapture($"Capture failed to start (0x{ex.HResult:X8}); Acrylic restored.");
         }
+    }
+
+    private async void OnDuplicationClick(object sender, RoutedEventArgs args)
+    {
+        if (_mode != Mode.Acrylic)
+            return;
+        if (EnergySaverOn())
+        {
+            StopCapture("Energy saver is on; refraction not started. Acrylic remains active.");
+            return;
+        }
+
+        _mode = Mode.Picking;
+        ApplyModeUi();
+        var dialog = new ContentDialog
+        {
+            XamlRoot = RootGrid.XamlRoot,
+            RequestedTheme = ElementTheme.Dark,
+            Title = "Capture this display without a Windows border?",
+            Content = "Desktop Duplication has no capture border or picker, so Windows will not show that this app is reading the screen. " +
+                "While it runs, this panel shows CAPTURE ACTIVE in red. Only the area behind the panel is copied, on the GPU; " +
+                "nothing is saved or sent. Capture stops when you press Stop, hide the panel, or after 10 minutes.",
+            PrimaryButtonText = "Start capture",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Close,
+        };
+
+        ContentDialogResult result;
+        try { result = await dialog.ShowAsync(); }
+        catch (Exception ex)
+        {
+            if (!_closing && _mode == Mode.Picking)
+                StopCapture($"Could not show the confirmation (0x{ex.HResult:X8}); Acrylic remains active.");
+            return;
+        }
+
+        if (_closing || _mode != Mode.Picking)
+            return;
+        if (result != ContentDialogResult.Primary)
+        {
+            StopCapture("Capture cancelled; Acrylic remains active.");
+            return;
+        }
+
+        BeginDuplication();
+    }
+
+    private void BeginDuplication()
+    {
+        try
+        {
+            if (!Native.TryGetMonitor(_hwnd, out IntPtr hmonitor, out Native.RECT m) || !TryGetClient(out Client client))
+                throw new InvalidOperationException("Could not locate the panel.");
+            if (Math.Abs(GlassCanvas.Dpi - 96f) > 0.5f)
+            {
+                StopCapture("Display scaling could not be normalized; Acrylic restored.");
+                return;
+            }
+
+            var monitor = new PxRect(m.Left, m.Top, m.Right - m.Left, m.Bottom - m.Top);
+            _padPx = (int)Math.Ceiling(BlurDip * _scale * 3) + 2;
+            var panel = new PxRect(0, 0, client.Width, client.Height);
+            if (!CropMath.TryToFrame(CropMath.Inflate(panel, _padPx), client.ScreenX, client.ScreenY, monitor, out PxRect crop))
+            {
+                StopCapture("The panel is too close to the display edge to crop; Acrylic restored.");
+                return;
+            }
+
+            _pattern = ProbePattern.Create(Random.Shared);
+            _acceptedFrames = 0;
+            _api = CaptureApi.Duplication;
+            _crop = new CanvasRenderTarget(GlassCanvas.Device, crop.Width, crop.Height, 96f);
+            Native.SetWindowDisplayAffinity(_hwnd, Native.WdaNone); // step 1 needs the panel capturable
+            _dda = DuplicationSource.Start(
+                GlassCanvas.Device, _crop, hmonitor, monitor, crop, _minFrameInterval, OnDuplicationFrame, OnDuplicationFault);
+
+            _mode = Mode.ProbeVisible;
+            ApplyModeUi();
+            SetStatus("Step 1/2: confirming this panel is visible in the capture…");
+            _verifyTimer.Start();
+            _nudgeTimer.Start();
+            _metricsTimer.Start();
+            _autoStopTimer.Start();
+            GlassCanvas.Invalidate();
+        }
+        catch (Exception ex)
+        {
+            StopCapture(ex is InvalidOperationException
+                ? $"{ex.Message} Acrylic restored."
+                : $"Capture failed to start (0x{ex.HResult:X8}); Acrylic restored.");
+        }
+    }
+
+    // Worker thread: keep the newest frame's details and wake the UI thread at most once at a time.
+    private void OnDuplicationFrame(DuplicationFrame frame)
+    {
+        Interlocked.Exchange(ref _ddaPresentTicks, frame.PresentTicks);
+        Volatile.Write(ref _ddaCopyMs, frame.CopyMs);
+        Volatile.Write(ref _ddaProtected, frame.ProtectedMasked);
+        if (Interlocked.Exchange(ref _ddaWake, 1) == 0 && !_dispatcher.TryEnqueue(OnDuplicationWake))
+            Interlocked.Exchange(ref _ddaWake, 0);
+    }
+
+    private void OnDuplicationFault(string message) =>
+        _dispatcher.TryEnqueue(() =>
+        {
+            if (_api == CaptureApi.Duplication && _mode != Mode.Acrylic)
+                StopCapture(message);
+        });
+
+    private void OnDuplicationWake()
+    {
+        Interlocked.Exchange(ref _ddaWake, 0);
+        if (_closing || _api != CaptureApi.Duplication || _crop is null || _mode is Mode.Acrylic or Mode.Picking)
+            return;
+
+        try
+        {
+            long presentTicks = Interlocked.Read(ref _ddaPresentTicks);
+            switch (_mode)
+            {
+                case Mode.ProbeVisible:
+                    _controlFraction = MeasureProbeInCrop();
+                    if (ProbePattern.Classify(_controlFraction) == ProbeVerdict.Present)
+                        EnterExclusionStep();
+                    break;
+
+                case Mode.ProbeExcluded:
+                    if (presentTicks < _excludedAtTicks + ExclusionSettleTicks)
+                        break; // composed before the affinity change could have applied
+                    _clearFraction = MeasureProbeInCrop();
+                    switch (ProbePattern.Classify(_clearFraction))
+                    {
+                        case ProbeVerdict.Absent:
+                            EnterRefracting("Desktop Duplication");
+                            RecordDuplicationFrame(presentTicks);
+                            break;
+                        case ProbeVerdict.Present:
+                            StopCapture("This window is still visible in the capture after exclusion; refraction refused.");
+                            break;
+                    }
+                    break;
+
+                case Mode.Refracting:
+                    RecordDuplicationFrame(presentTicks);
+                    break;
+            }
+        }
+        catch (Exception ex) { StopCapture($"Capture stopped ({ex.Message}); Acrylic restored."); }
+    }
+
+    private void RecordDuplicationFrame(long presentTicks)
+    {
+        long now100ns = (long)(Stopwatch.GetTimestamp() * (TimeSpan.TicksPerSecond / (double)Stopwatch.Frequency));
+        _ageMs = presentTicks <= 0 ? 0 : Math.Max(0, (now100ns - presentTicks) / (double)TimeSpan.TicksPerMillisecond);
+        _copyMs = Volatile.Read(ref _ddaCopyMs);
+        _acceptedFrames++;
+        GlassCanvas.Invalidate();
+    }
+
+    // The probe sits inside the panel, so it is also inside the crop already copied on the GPU.
+    private double MeasureProbeInCrop()
+    {
+        if (_crop is null || !TryGetClient(out Client client))
+            throw new InvalidOperationException("could not locate the panel");
+        PxRect local = CropMath.ProbeRect(client.Width, _scale, out int cell);
+        byte[] pixels = _crop.GetPixelBytes(local.X + _padPx, local.Y + _padPx, local.Width, local.Height);
+        return ProbePattern.MatchFraction(pixels, cell, cell, _pattern);
+    }
+
+    // Capture frames only arrive when the screen changes; redrawing the grid makes DWM compose a fresh one.
+    private void OnNudge()
+    {
+        if (_mode is Mode.ProbeVisible or Mode.ProbeExcluded)
+            GlassCanvas.Invalidate();
+        else
+            _nudgeTimer.Stop();
     }
 
     // Free-threaded pool thread: keep only the newest frame and hand it to the UI thread.
@@ -288,7 +490,7 @@ public sealed partial class MainWindow : Window
     private void ScheduleDrain()
     {
         TimeSpan wait = _mode == Mode.Refracting
-            ? MinFrameInterval - Stopwatch.GetElapsedTime(_lastDrain)
+            ? _minFrameInterval - Stopwatch.GetElapsedTime(_lastDrain)
             : TimeSpan.Zero;
         if (wait <= TimeSpan.Zero)
             Drain();
@@ -346,7 +548,7 @@ public sealed partial class MainWindow : Window
                 switch (ProbePattern.Classify(_clearFraction))
                 {
                     case ProbeVerdict.Absent:
-                        EnterRefracting(item: _item!);
+                        EnterRefracting(_item!.DisplayName);
                         if (!CopyCrop(source, client, monitor, frame, started))
                             StopCapture("The panel is too close to the display edge to crop; Acrylic restored.");
                         break;
@@ -381,13 +583,15 @@ public sealed partial class MainWindow : Window
         _verifyTimer.Start();
         SetStatus("Step 2/2: confirming this window is now absent from the capture…");
         ApplyModeUi();
+        GlassCanvas.Invalidate();
     }
 
-    private void EnterRefracting(GraphicsCaptureItem item)
+    private void EnterRefracting(string source)
     {
         _verifyTimer.Stop();
+        _nudgeTimer.Stop();
         _mode = Mode.Refracting;
-        SetStatus($"{item.DisplayName}  ·  exclusion verified (probe seen {_controlFraction:P0} → {_clearFraction:P0})  ·  latest panel crop in RAM only");
+        SetStatus($"{source}  ·  exclusion verified (probe seen {_controlFraction:P0} → {_clearFraction:P0})  ·  only the panel crop is kept, in GPU memory");
         ApplyModeUi();
     }
 
@@ -522,12 +726,23 @@ public sealed partial class MainWindow : Window
 
     private void OnBendChanged(object sender, RangeBaseValueChangedEventArgs args) => GlassCanvas?.Invalidate();
 
+    private void OnFpsChanged(object sender, SelectionChangedEventArgs args)
+    {
+        if (sender is not ComboBox { SelectedItem: ComboBoxItem { Tag: string tag } } || !int.TryParse(tag, out int fps))
+            return;
+        _minFrameInterval = FramePacing.MinInterval(fps);
+        if (_dda is not null)
+            _dda.MinInterval = _minFrameInterval;
+    }
+
     private void StopCapture(string status)
     {
         _mode = Mode.Acrylic;
         _verifyTimer.Stop();
         _drainTimer.Stop();
         _metricsTimer.Stop();
+        _nudgeTimer.Stop();
+        _autoStopTimer.Stop();
         lock (_gate)
         {
             _accepting = false;
@@ -547,10 +762,13 @@ public sealed partial class MainWindow : Window
         _session = null;
         _pool?.Dispose();
         _pool = null;
+        _dda?.Dispose(); // joins the worker before the crop it writes to is released
+        _dda = null;
         _crop?.Dispose();
         _crop = null;
         _bezelMap?.Dispose();
         _bezelMap = null;
+        _api = CaptureApi.None;
         Native.SetWindowDisplayAffinity(_hwnd, Native.WdaNone);
 
         if (_closing)
@@ -570,13 +788,14 @@ public sealed partial class MainWindow : Window
 
         StopButton.Visibility = _mode is Mode.Acrylic or Mode.Picking ? Visibility.Collapsed : Visibility.Visible;
         RefractionButton.IsEnabled = _mode == Mode.Acrylic;
+        DuplicationButton.IsEnabled = _mode == Mode.Acrylic;
         BendSlider.IsEnabled = _mode == Mode.Refracting;
 
         (string text, Color color) = _mode switch
         {
-            Mode.Picking => ("CHOOSING DISPLAY", Color.FromArgb(255, 255, 197, 92)),
+            Mode.Picking => ("AWAITING YOUR CHOICE", Color.FromArgb(255, 255, 197, 92)),
             Mode.ProbeVisible or Mode.ProbeExcluded => ("VERIFYING CAPTURE", Color.FromArgb(255, 255, 197, 92)),
-            Mode.Refracting => ("CAPTURE ACTIVE", Color.FromArgb(255, 255, 120, 92)),
+            Mode.Refracting => (_api == CaptureApi.Duplication ? "CAPTURE ACTIVE  ·  NO WINDOWS BORDER" : "CAPTURE ACTIVE", Color.FromArgb(255, 255, 90, 80)),
             _ => ("CAPTURE OFF", Color.FromArgb(255, 155, 163, 176)),
         };
         CaptureBadge.Text = text;
@@ -602,7 +821,8 @@ public sealed partial class MainWindow : Window
         _cpuSampleStart = now;
 
         MetricsText.Text = _mode == Mode.Refracting
-            ? $"{_fps:0.0} fps · age {_ageMs:0} ms · copy {_copyMs:0.0} ms · draw {_drawMs:0.0} ms · CPU {_cpuPct:0}% · {_process.WorkingSet64 / (1024 * 1024)} MB"
+            ? $"{(_api == CaptureApi.Duplication ? "DXGI" : "WGC")} · {_fps:0.0} fps · age {_ageMs:0} ms · copy {_copyMs:0.0} ms · draw {_drawMs:0.0} ms · CPU {_cpuPct:0}% · {_process.WorkingSet64 / (1024 * 1024)} MB" +
+              (Volatile.Read(ref _ddaProtected) ? " · protected content is masked (black) on this display" : string.Empty)
             : string.Empty;
     }
 

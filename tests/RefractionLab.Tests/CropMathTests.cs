@@ -67,4 +67,27 @@ public class CropMathTests
         Assert.True(probe.X >= 0 && probe.Y >= 0);
         Assert.True(probe.X + probe.Width <= width && probe.Y + probe.Height <= height);
     }
+
+    private static readonly PxRect Crop = new(100, 100, 700, 360);
+
+    [Theory]
+    [InlineData(0, 0, 50, 50, false)]        // fully above-left
+    [InlineData(0, 0, 100, 100, false)]      // touches the corner only: no overlap
+    [InlineData(0, 0, 101, 101, true)]       // one pixel of overlap
+    [InlineData(300, 200, 10, 10, true)]     // inside
+    [InlineData(790, 450, 50, 50, true)]     // overlaps bottom-right corner
+    [InlineData(800, 460, 50, 50, false)]    // touches bottom-right only
+    [InlineData(50, 50, 2000, 2000, true)]   // covers the crop
+    [InlineData(300, 200, 0, 10, false)]     // empty rect never counts
+    public void IntersectsMatchesPixelOverlap(int x, int y, int w, int h, bool expected) =>
+        Assert.Equal(expected, CropMath.Intersects(new PxRect(x, y, w, h), Crop));
+
+    [Fact]
+    public void AnyIntersectsIsTrueIfAtLeastOneRectTouchesTheCrop()
+    {
+        PxRect[] far = [new(0, 0, 40, 40), new(1500, 900, 200, 100)];
+        Assert.False(CropMath.AnyIntersects(far, Crop));
+        Assert.True(CropMath.AnyIntersects([.. far, new PxRect(400, 300, 5, 5)], Crop));
+        Assert.False(CropMath.AnyIntersects([], Crop));
+    }
 }

@@ -25,14 +25,16 @@ internal static class Native
     [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool GetWindowDisplayAffinity(IntPtr hwnd, out uint affinity);
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
 
-    public static bool TryGetMonitorRect(IntPtr hwnd, out RECT rect)
+    public static bool TryGetMonitor(IntPtr hwnd, out IntPtr monitor, out RECT rect)
     {
         var info = new MONITORINFO { Size = Marshal.SizeOf<MONITORINFO>() };
-        IntPtr monitor = MonitorFromWindow(hwnd, MonitorDefaultToNearest);
+        monitor = MonitorFromWindow(hwnd, MonitorDefaultToNearest);
         bool ok = monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref info);
         rect = info.Monitor;
         return ok;
     }
+
+    public static bool TryGetMonitorRect(IntPtr hwnd, out RECT rect) => TryGetMonitor(hwnd, out _, out rect);
 
     public static bool ExcludeFromCapture(IntPtr hwnd) =>
         SetWindowDisplayAffinity(hwnd, WdaExcludeFromCapture) &&

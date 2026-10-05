@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  logic-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: dotnet test tests/RefractionLab.Tests/RefractionLab.Tests.csproj -c Release
+
+  # Compiles the XAML and publishes the self-contained folder the README tells people to run.
+  # This proves it builds on Windows; it does not exercise screen capture (no interactive desktop/GPU).
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: dotnet build src/RefractionLab.csproj -c Release -p:Platform=x64
+      - run: dotnet publish src/RefractionLab.csproj -c Release -p:Platform=x64 --self-contained true -o publish
+      - name: Published executable exists
+        shell: pwsh
+        run: if (-not (Test-Path publish/RefractionLab.exe)) { throw 'publish/RefractionLab.exe missing' }

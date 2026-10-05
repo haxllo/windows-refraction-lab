@@ -13,6 +13,7 @@ using Microsoft.UI.Xaml.Media;
 using Microsoft.Windows.System.Power;
 using RefractionLab.Capture;
 using RefractionLab.Logic;
+using RefractionLab.Render;
 using System.Diagnostics;
 using System.Globalization;
 using System.Numerics;
@@ -76,11 +77,10 @@ public sealed partial class MainWindow : Window
 
     private string _borderNote = string.Empty;
     private int _displayHz;
-    private GaussianBlurEffect? _blurFx;
-    private Transform2DEffect? _mapFx;
-    private DisplacementMapEffect? _displaceFx;
-    private CanvasGeometry? _clipGeometry;
-    private (CanvasBitmap?, CanvasBitmap?, float, float, float, float) _effectKey;
+    private GlassPainter? _painter;            // UI-thread renderer state (mode B, and mode C unless the render thread is on)
+    private volatile ThreadedRenderer? _renderer;
+    private volatile int _bendPct = 50;        // slider value readable from the render thread
+    private string _renderNote = string.Empty;
 
     private GraphicsCaptureItem? _item;
     private Direct3D11CaptureFramePool? _pool;
@@ -96,8 +96,6 @@ public sealed partial class MainWindow : Window
     private double _clearFraction;
     private int _padPx;
     private CanvasRenderTarget? _crop;
-    private CanvasBitmap? _bezelMap;
-    private (int Width, int Height, float Radius, float Bezel) _bezelKey;
 
     private readonly StageCounters _counters = new();
     private StageRates _rates;
@@ -416,7 +414,7 @@ public sealed partial class MainWindow : Window
             _api = CaptureApi.Duplication;
             _displayHz = Native.GetRefreshRateHz(_hwnd);
             _borderNote = string.Empty;
-            OpenLogIfWanted("dxgi");
+            OpenLogIfWanted(ThreadedBox.IsChecked == true ? "dxgi-thread" : "dxgi");
             _crop = new CanvasRenderTarget(GlassCanvas.Device, crop.Width, crop.Height, 96f);
             Native.SetWindowDisplayAffinity(_hwnd, Native.WdaNone); // step 1 needs the panel capturable
             _throttle = new Throttle(TimeSpan.Zero, QueueDuplicationWake);
@@ -450,9 +448,18 @@ public sealed partial class MainWindow : Window
         _throttle?.Signal();
     }
 
-    // Throttle callback (worker or timer thread): wake the UI thread at most once at a time.
+    // Throttle callback (worker or timer thread). With the render thread on, go straight to it; otherwise
+    // wake the UI thread at most once at a time.
     private void QueueDuplicationWake()
     {
+        ThreadedRenderer? renderer = _renderer;
+        if (renderer is not null)
+        {
+            _counters.Add(Stage.Used);
+            renderer.Request();
+            return;
+        }
+
         if (Interlocked.Exchange(ref _ddaWake, 1) != 0)
             return;
 
@@ -512,11 +519,69 @@ public sealed partial class MainWindow : Window
 
     private void RecordDuplicationFrame(long presentTicks)
     {
-        long now100ns = (long)(Stopwatch.GetTimestamp() * (TimeSpan.TicksPerSecond / (double)Stopwatch.Frequency));
-        _ageMs = presentTicks <= 0 ? 0 : Math.Max(0, (now100ns - presentTicks) / (double)TimeSpan.TicksPerMillisecond);
+        _ageMs = AgeMs(presentTicks);
         _copyMs = Volatile.Read(ref _ddaCopyMs);
         _counters.Add(Stage.Used);
-        RequestDraw();
+        if (_renderer is { } renderer)
+            renderer.Request();
+        else
+            RequestDraw();
+    }
+
+    private static double AgeMs(long presentTicks)
+    {
+        long now100ns = (long)(Stopwatch.GetTimestamp() * (TimeSpan.TicksPerSecond / (double)Stopwatch.Frequency));
+        return presentTicks <= 0 ? 0 : Math.Max(0, (now100ns - presentTicks) / (double)TimeSpan.TicksPerMillisecond);
+    }
+
+    // Render thread: record what the UI path records in OnGlassDraw.
+    private void OnRenderFrame(RenderFrame frame)
+    {
+        _renderLag.Add(frame.WaitMs);
+        _counters.Add(Stage.Drawn);
+        Volatile.Write(ref _drawMs, frame.DrawMs);
+        Volatile.Write(ref _ageMs, AgeMs(Interlocked.Read(ref _ddaPresentTicks)));
+        Volatile.Write(ref _copyMs, Volatile.Read(ref _ddaCopyMs));
+    }
+
+    private void OnRenderFault(string message) =>
+        _dispatcher.TryEnqueue(() =>
+        {
+            if (_renderer is not null && _mode != Mode.Acrylic)
+                StopCapture(message);
+        });
+
+    // UI thread, once verification has passed. Any failure here falls back to the UI renderer.
+    private void StartThreadedRenderer()
+    {
+        if (_api != CaptureApi.Duplication || ThreadedBox.IsChecked != true || _crop is null)
+            return;
+
+        ThreadedRenderer? renderer = null;
+        try
+        {
+            if (!TryGetClient(out Client client))
+                throw new InvalidOperationException("could not locate the panel");
+
+            renderer = new ThreadedRenderer(
+                GlassCanvas.Device, _crop, client.Width, client.Height, (float)_scale, _padPx,
+                (float)(CornerDip * _scale), (float)(BezelDip * _scale), (float)(BlurDip * _scale),
+                () => (float)(_bendPct / 100.0 * MaxShiftDip * _scale), OnRenderFrame, OnRenderFault);
+            SwapPanel.SwapChain = renderer.SwapChain;
+            SwapPanel.Visibility = Visibility.Visible;
+            _renderer = renderer;
+            renderer.Start();
+            _renderNote = "rendering on a separate thread";
+        }
+        catch (Exception ex)
+        {
+            _renderer = null;
+            SwapPanel.SwapChain = null;
+            SwapPanel.Visibility = Visibility.Collapsed;
+            renderer?.Dispose();
+            _renderNote = $"separate render thread unavailable (0x{ex.HResult:X8}); using the UI renderer";
+            LogEvent("render_fallback", "ui");
+        }
     }
 
     // The probe sits inside the panel, so it is also inside the crop already copied on the GPU.
@@ -667,12 +732,14 @@ public sealed partial class MainWindow : Window
         _verifyTimer.Stop();
         _nudgeTimer.Stop();
         _mode = Mode.Refracting;
+        StartThreadedRenderer();
         if (_throttle is not null)
             _throttle.Interval = _minFrameInterval;
         LogEvent("refracting", string.Create(CultureInfo.InvariantCulture,
             $"probe_seen={_controlFraction:0.00} probe_clear={_clearFraction:0.00}"));
         string border = _borderNote.Length > 0 ? $"  ·  {_borderNote}" : string.Empty;
-        SetStatus($"{source}  ·  exclusion verified (probe seen {_controlFraction:P0} → {_clearFraction:P0})  ·  only the panel crop is kept, in GPU memory{border}");
+        string render = _renderNote.Length > 0 ? $"  ·  {_renderNote}" : string.Empty;
+        SetStatus($"{source}  ·  exclusion verified (probe seen {_controlFraction:P0} → {_clearFraction:P0})  ·  only the panel crop is kept, in GPU memory{border}{render}");
         ApplyModeUi();
     }
 
@@ -714,7 +781,7 @@ public sealed partial class MainWindow : Window
             float h = (float)sender.Size.Height;
             if (_mode is Mode.ProbeVisible or Mode.ProbeExcluded)
                 DrawProbe(args.DrawingSession);
-            else if (_mode == Mode.Refracting && _crop is not null)
+            else if (_mode == Mode.Refracting && _crop is not null && _renderer is null)
             {
                 DrawRefraction(sender, args.DrawingSession, w, h);
                 _counters.Add(Stage.Drawn);
@@ -743,60 +810,10 @@ public sealed partial class MainWindow : Window
 
     private void DrawRefraction(CanvasControl sender, CanvasDrawingSession ds, float w, float h)
     {
-        float radius = (float)(CornerDip * _scale);
         float shift = (float)(BendSlider.Value / 100.0 * MaxShiftDip * _scale);
-        EnsureBezelMap(sender.Device, (int)Math.Round(w), (int)Math.Round(h), radius, (float)(BezelDip * _scale));
-        EnsureEffects(sender, w, h, radius, (float)(BlurDip * _scale));
-
-        _displaceFx!.Amount = 2 * shift; // map spans [-0.5, +0.5] of Amount, see BezelMap
-        using CanvasActiveLayer layer = ds.CreateLayer(1f, _clipGeometry!);
-        ds.DrawImage(_displaceFx, 0, 0, new Rect(_padPx, _padPx, w, h));
-        ds.FillRectangle(0, 0, w, h, Color.FromArgb(56, 12, 14, 20));
-    }
-
-    // Built once per size or source change, so the per-frame cost is the draw itself.
-    private void EnsureEffects(CanvasControl sender, float w, float h, float radius, float blurPx)
-    {
-        (CanvasBitmap?, CanvasBitmap?, float, float, float, float) key = (_crop, _bezelMap, w, h, radius, blurPx);
-        if (_displaceFx is not null && _effectKey == key)
-            return;
-
-        DisposeEffects();
-        _clipGeometry = CanvasGeometry.CreateRoundedRectangle(sender, 0, 0, w, h, radius, radius);
-        _blurFx = new GaussianBlurEffect { Source = _crop, BlurAmount = blurPx, BorderMode = EffectBorderMode.Hard };
-        _mapFx = new Transform2DEffect { Source = _bezelMap, TransformMatrix = Matrix3x2.CreateTranslation(_padPx, _padPx) };
-        _displaceFx = new DisplacementMapEffect
-        {
-            Source = _blurFx,
-            Displacement = _mapFx,
-            XChannelSelect = EffectChannelSelect.Red,
-            YChannelSelect = EffectChannelSelect.Green,
-        };
-        _effectKey = key;
-    }
-
-    private void DisposeEffects()
-    {
-        _displaceFx?.Dispose();
-        _mapFx?.Dispose();
-        _blurFx?.Dispose();
-        _clipGeometry?.Dispose();
-        _displaceFx = null;
-        _mapFx = null;
-        _blurFx = null;
-        _clipGeometry = null;
-    }
-
-    private void EnsureBezelMap(CanvasDevice device, int width, int height, float radius, float bezel)
-    {
-        var key = (width, height, radius, bezel);
-        if (_bezelMap is not null && _bezelKey == key)
-            return;
-        _bezelMap?.Dispose();
-        _bezelMap = CanvasBitmap.CreateFromBytes(
-            device, BezelMap.Generate(width, height, radius, bezel), width, height,
-            DirectXPixelFormat.B8G8R8A8UIntNormalized, 96f);
-        _bezelKey = key;
+        (_painter ??= new GlassPainter()).Draw(
+            sender, ds, _crop!, _padPx, w, h,
+            (float)(CornerDip * _scale), (float)(BezelDip * _scale), (float)(BlurDip * _scale), shift);
     }
 
     private bool TryGetClient(out Client client)
@@ -826,7 +843,12 @@ public sealed partial class MainWindow : Window
     private void OnStopClick(object sender, RoutedEventArgs args) =>
         StopCapture("Capture stopped by user; Acrylic restored.");
 
-    private void OnBendChanged(object sender, RangeBaseValueChangedEventArgs args) => GlassCanvas?.Invalidate();
+    private void OnBendChanged(object sender, RangeBaseValueChangedEventArgs args)
+    {
+        _bendPct = (int)Math.Round(args.NewValue);
+        GlassCanvas?.Invalidate();
+        _renderer?.Request(); // static content produces no frames, so ask for one
+    }
 
     private void OnFpsChanged(object sender, SelectionChangedEventArgs args)
     {
@@ -869,11 +891,18 @@ public sealed partial class MainWindow : Window
         _dda = null;
         _throttle?.Dispose();
         _throttle = null;
+        ThreadedRenderer? renderer = _renderer;
+        _renderer = null;
+        if (renderer is not null && !_closing)
+        {
+            SwapPanel.SwapChain = null;
+            SwapPanel.Visibility = Visibility.Collapsed;
+        }
+        renderer?.Dispose(); // joins the render thread before the crop it reads is released
+        _painter?.Dispose();
+        _painter = null;
         _crop?.Dispose();
         _crop = null;
-        DisposeEffects();
-        _bezelMap?.Dispose();
-        _bezelMap = null;
         _api = CaptureApi.None;
         Native.SetWindowDisplayAffinity(_hwnd, Native.WdaNone);
 
@@ -898,6 +927,7 @@ public sealed partial class MainWindow : Window
         RefractionButton.IsEnabled = _mode == Mode.Acrylic;
         DuplicationButton.IsEnabled = _mode == Mode.Acrylic;
         LogBox.IsEnabled = _mode == Mode.Acrylic;
+        ThreadedBox.IsEnabled = _mode == Mode.Acrylic;
         BendSlider.IsEnabled = _mode == Mode.Refracting;
 
         (string text, Color color) = _mode switch
@@ -916,6 +946,7 @@ public sealed partial class MainWindow : Window
 
     private void ResetStats()
     {
+        _renderNote = string.Empty;
         _counters.TakeRates(TimeSpan.FromSeconds(1));
         _dispatchLag.Take();
         _renderLag.Take();
@@ -954,7 +985,7 @@ public sealed partial class MainWindow : Window
 
         bool dda = _api == CaptureApi.Duplication;
         _log.WriteSample(new StatsSample(
-            dda ? "dxgi" : "wgc", FramePacing.Label(_maxFpsSetting), _displayHz, (int)Math.Round(BendSlider.Value),
+            dda ? (_renderer is not null ? "dxgi-thread" : "dxgi") : "wgc", FramePacing.Label(_maxFpsSetting), _displayHz, (int)Math.Round(BendSlider.Value),
             _rates.Source, _rates.Used, _rates.Drawn, _ageMs, _copyMs, _drawMs,
             _dispatchSummary, _renderSummary, dda ? Volatile.Read(ref _ddaLockMs) : (double?)null,
             _cpuPct, Environment.WorkingSet / (1024 * 1024), Volatile.Read(ref _ddaProtected)));
@@ -1020,7 +1051,9 @@ public sealed partial class MainWindow : Window
             WriteLogSample();
 
         string hz = _displayHz > 0 ? $"{_displayHz} Hz" : "? Hz";
-        string lag = $"lag avg/max ms: ui queue {_dispatchSummary.AvgMs:0}/{_dispatchSummary.MaxMs:0} · invalidate→draw {_renderSummary.AvgMs:0}/{_renderSummary.MaxMs:0}" +
+        string lag = (_renderer is not null
+                ? $"lag avg/max ms: request→draw start {_renderSummary.AvgMs:0}/{_renderSummary.MaxMs:0} · render thread (no UI hop)"
+                : $"lag avg/max ms: ui queue {_dispatchSummary.AvgMs:0}/{_dispatchSummary.MaxMs:0} · invalidate→draw {_renderSummary.AvgMs:0}/{_renderSummary.MaxMs:0}") +
             (_api == CaptureApi.Duplication ? $" · device lock {Volatile.Read(ref _ddaLockMs):0.0}" : string.Empty);
         MetricsText.Text = _mode == Mode.Refracting
             ? $"{(_api == CaptureApi.Duplication ? "DXGI" : "WGC")} · per second: source {_rates.Source:0} → used {_rates.Used:0} → drawn {_rates.Drawn:0} (display {hz}) · age {_ageMs:0} ms · copy {_copyMs:0.0} ms · draw {_drawMs:0.0} ms · CPU {_cpuPct:0}% of 1 core · {Environment.WorkingSet / (1024 * 1024)} MB\n{lag}" +

@@ -22,7 +22,7 @@ public readonly record struct StatsSample(
     double? DeviceLockMs,
     double CpuPct,
     long WorkingSetMb,
-    bool ProtectedMasked,
+    bool? ProtectedMasked,   // null when the capture API has no such signal (Windows Graphics Capture)
     RenderTiming? Render = null);
 
 /// <summary>
@@ -61,7 +61,7 @@ public static class StatsCsv
         f[16] = s.DeviceLockMs is double lockMs ? Num(lockMs, "0.00") : string.Empty;
         f[17] = Num(s.CpuPct, "0.0");
         f[18] = s.WorkingSetMb.ToString(CultureInfo.InvariantCulture);
-        f[19] = s.ProtectedMasked ? "1" : "0";
+        f[19] = s.ProtectedMasked is bool masked ? (masked ? "1" : "0") : string.Empty;
         f[20] = s.Render is { } r ? Num(r.PaintAvgMs, "0.0") : string.Empty;
         f[21] = s.Render is { } r2 ? Num(r2.BlitAvgMs, "0.0") : string.Empty;
         f[22] = s.Render is { } r3 ? Num(r3.PresentAvgMs, "0.0") : string.Empty;

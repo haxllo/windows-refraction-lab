@@ -958,6 +958,8 @@ public sealed partial class MainWindow : Window
     private void ResetStats()
     {
         _renderNote = string.Empty;
+        Volatile.Write(ref _ddaProtected, false);   // set only by Desktop Duplication; must not leak between sessions
+        Volatile.Write(ref _ddaLockMs, 0);
         _counters.TakeRates(TimeSpan.FromSeconds(1));
         _dispatchLag.Take();
         _renderLag.Take();
@@ -1005,7 +1007,7 @@ public sealed partial class MainWindow : Window
             dda ? (_renderer is not null ? "dxgi-thread" : "dxgi") : "wgc", FramePacing.Label(_maxFpsSetting), _displayHz, (int)Math.Round(BendSlider.Value),
             _rates.Source, _rates.Used, _rates.Drawn, _ageMs, _copyMs, _drawMs,
             _dispatchSummary, _renderSummary, dda ? Volatile.Read(ref _ddaLockMs) : (double?)null,
-            _cpuPct, Environment.WorkingSet / (1024 * 1024), Volatile.Read(ref _ddaProtected),
+            _cpuPct, Environment.WorkingSet / (1024 * 1024), dda ? Volatile.Read(ref _ddaProtected) : (bool?)null,
             _renderer is not null
                 ? new RenderTiming(_paintSummary.AvgMs, _blitSummary.AvgMs, _presentSummary.AvgMs, _totalSummary.MaxMs)
                 : (RenderTiming?)null));
@@ -1084,7 +1086,7 @@ public sealed partial class MainWindow : Window
                 : string.Empty);
         MetricsText.Text = _mode == Mode.Refracting
             ? $"{(_api == CaptureApi.Duplication ? "DXGI" : "WGC")} · per second: source {_rates.Source:0} → used {_rates.Used:0} → drawn {_rates.Drawn:0} (display {hz}) · age {_ageMs:0} ms · copy {_copyMs:0.0} ms · draw {_drawMs:0.0} ms · CPU {_cpuPct:0}% of 1 core · {Environment.WorkingSet / (1024 * 1024)} MB\n{lag}" +
-              (Volatile.Read(ref _ddaProtected) ? " · protected content is masked (black) on this display" : string.Empty) + LogStatusLine()
+              (_api == CaptureApi.Duplication && Volatile.Read(ref _ddaProtected) ? " · protected content is masked (black) on this display" : string.Empty) + LogStatusLine()
             : string.Empty;
     }
 

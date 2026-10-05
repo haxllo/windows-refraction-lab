@@ -81,17 +81,34 @@
         </Border>
       </StackPanel>
 
-      <StackPanel Grid.Row="3" Orientation="Horizontal" Spacing="8" Margin="0,6,0,8">
-        <Button x:Name="AcrylicButton" Content="A  Acrylic only" Click="OnAcrylicClick" />
-        <Button x:Name="RefractionButton" Content="B  Display refraction" Click="OnRefractionClick" />
-        <Button x:Name="StopButton" Content="Stop capture" Click="OnStopClick" Visibility="Collapsed" />
-        <TextBlock Text="Bend" FontSize="11" Foreground="#FF9BA3B0" VerticalAlignment="Center" Margin="12,0,0,0" />
-        <Slider x:Name="BendSlider" Width="130" Minimum="0" Maximum="100" Value="50" IsEnabled="False" VerticalAlignment="Center" ValueChanged="OnBendChanged" />
+      <StackPanel Grid.Row="3" Spacing="6" Margin="0,6,0,8">
+        <StackPanel Orientation="Horizontal" Spacing="8">
+          <Button x:Name="AcrylicButton" Content="A  Acrylic only" Click="OnAcrylicClick" />
+          <Button x:Name="RefractionButton" Content="B  Refraction · Windows capture" Click="OnRefractionClick"
+                  ToolTipService.ToolTip="Windows Graphics Capture: you pick the display, and Windows draws a yellow border while it runs." />
+          <Button x:Name="DuplicationButton" Content="C  Refraction · no border" Click="OnDuplicationClick"
+                  ToolTipService.ToolTip="DXGI Desktop Duplication: no Windows border or picker. Only this panel's badge shows that capture is active." />
+          <Button x:Name="StopButton" Content="Stop capture" Click="OnStopClick" Visibility="Collapsed" />
+        </StackPanel>
+        <StackPanel Orientation="Horizontal" Spacing="8">
+          <TextBlock Text="Bend" FontSize="11" Foreground="#FF9BA3B0" VerticalAlignment="Center" />
+          <Slider x:Name="BendSlider" Width="130" Minimum="0" Maximum="100" Value="50" IsEnabled="False" VerticalAlignment="Center" ValueChanged="OnBendChanged" />
+          <TextBlock Text="Max FPS" FontSize="11" Foreground="#FF9BA3B0" VerticalAlignment="Center" Margin="16,0,0,0" />
+          <ComboBox x:Name="FpsBox" Width="76" SelectedIndex="1" SelectionChanged="OnFpsChanged">
+            <ComboBoxItem Content="15" Tag="15" />
+            <ComboBoxItem Content="30" Tag="30" />
+            <ComboBoxItem Content="60" Tag="60" />
+          </ComboBox>
+        </StackPanel>
       </StackPanel>
 
       <Grid Grid.Row="4" BorderBrush="#1FFFFFFF" BorderThickness="0,1,0,0" Padding="0,8,0,0">
-        <TextBlock x:Name="StatusText" Text="Acrylic baseline  ·  desktop capture is off" FontSize="10" Foreground="#FFAEB6C2" TextTrimming="CharacterEllipsis" Margin="0,0,300,0" />
-        <TextBlock x:Name="MetricsText" FontSize="9" Foreground="#FF8E95A1" HorizontalAlignment="Right" />
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto" />
+          <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <TextBlock x:Name="StatusText" Text="Acrylic baseline  ·  desktop capture is off" FontSize="10" Foreground="#FFAEB6C2" TextWrapping="Wrap" MaxLines="2" />
+        <TextBlock x:Name="MetricsText" Grid.Row="1" FontSize="9" Foreground="#FF8E95A1" Margin="0,3,0,0" />
       </Grid>
     </Grid>
   </Grid>

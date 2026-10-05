@@ -31,16 +31,14 @@ internal sealed class DuplicationSource : IDisposable
     private readonly Action<string> _onFault;
     private readonly ManualResetEventSlim _stop = new(false);
     private readonly Thread _thread;
-    private long _minIntervalTicks;
+    private long _sourceUpdates;
 
-    public TimeSpan MinInterval
-    {
-        set => Interlocked.Exchange(ref _minIntervalTicks, (long)(value.TotalSeconds * Stopwatch.Frequency));
-    }
+    /// <summary>Desktop updates Windows reported on this display (any region), summed over all acquired frames.</summary>
+    public long SourceUpdates => Interlocked.Read(ref _sourceUpdates);
 
     private DuplicationSource(
         CanvasDevice canvasDevice, ID3D11Device d3d, ID3D11Texture2D cropTexture, IDXGIOutputDuplication duplication,
-        PxRect crop, TimeSpan minInterval, Action<DuplicationFrame> onFrame, Action<string> onFault)
+        PxRect crop, Action<DuplicationFrame> onFrame, Action<string> onFault)
     {
         _canvasDevice = canvasDevice;
         _d3d = d3d;
@@ -51,14 +49,13 @@ internal sealed class DuplicationSource : IDisposable
         _srcBox = new Box(crop.X, crop.Y, 0, crop.X + crop.Width, crop.Y + crop.Height, 1);
         _onFrame = onFrame;
         _onFault = onFault;
-        MinInterval = minInterval;
         _thread = new Thread(Run) { IsBackground = true, Name = "DesktopDuplication" };
     }
 
     /// <exception cref="InvalidOperationException">Any setup failure; the message is safe to show.</exception>
     public static DuplicationSource Start(
         CanvasDevice canvasDevice, IDirect3DSurface cropSurface, IntPtr monitor, PxRect monitorRect, PxRect crop,
-        TimeSpan minInterval, Action<DuplicationFrame> onFrame, Action<string> onFault)
+        Action<DuplicationFrame> onFrame, Action<string> onFault)
     {
         ID3D11Device? d3d = null;
         ID3D11Texture2D? cropTexture = null;
@@ -75,7 +72,7 @@ internal sealed class DuplicationSource : IDisposable
                 throw new InvalidOperationException("Crop buffer does not match the panel size.");
 
             duplication = Duplicate(d3d, monitor, monitorRect);
-            var source = new DuplicationSource(canvasDevice, d3d, cropTexture, duplication, crop, minInterval, onFrame, onFault);
+            var source = new DuplicationSource(canvasDevice, d3d, cropTexture, duplication, crop, onFrame, onFault);
             source._thread.Start();
             return source;
         }
@@ -129,7 +126,6 @@ internal sealed class DuplicationSource : IDisposable
 
     private void Run()
     {
-        long lastAcquire = 0;
         bool first = true;
         var dirty = new RawRect[64];
         var moves = new OutduplMoveRect[32];
@@ -137,15 +133,6 @@ internal sealed class DuplicationSource : IDisposable
         {
             while (!_stop.IsSet)
             {
-                long minTicks = Interlocked.Read(ref _minIntervalTicks);
-                if (lastAcquire != 0 && minTicks > 0)
-                {
-                    long remaining = minTicks - (Stopwatch.GetTimestamp() - lastAcquire);
-                    // Updates accumulate in DXGI while we wait, so the newest state is always delivered.
-                    if (remaining > 0 && _stop.Wait(TimeSpan.FromSeconds(remaining / (double)Stopwatch.Frequency)))
-                        break;
-                }
-
                 Result result = _duplication.AcquireNextFrame(100, out OutduplFrameInfo info, out IDXGIResource? resource);
                 if (result.Code == DxgiResultCode.WaitTimeout.Code)
                     continue;
@@ -157,7 +144,8 @@ internal sealed class DuplicationSource : IDisposable
                     return;
                 }
 
-                lastAcquire = Stopwatch.GetTimestamp();
+                if (info.LastPresentTime != 0)
+                    Interlocked.Add(ref _sourceUpdates, Math.Max(1L, (long)info.AccumulatedFrames));
                 try
                 {
                     bool changed = first || (info.LastPresentTime != 0 && TouchesCrop(info, ref dirty, ref moves));

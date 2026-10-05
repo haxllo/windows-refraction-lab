@@ -48,7 +48,6 @@ public sealed partial class MainWindow : Window
 
     private readonly DispatcherQueue _dispatcher;
     private readonly DispatcherQueueTimer _verifyTimer;
-    private readonly DispatcherQueueTimer _drainTimer;
     private readonly DispatcherQueueTimer _metricsTimer;
     private readonly DispatcherQueueTimer _nudgeTimer;
     private readonly DispatcherQueueTimer _autoStopTimer;
@@ -82,7 +81,7 @@ public sealed partial class MainWindow : Window
     private Direct3D11CaptureFrame? _pending;   // newest undelivered frame; guarded by _gate
     private bool _drainQueued;                  // guarded by _gate
     private bool _accepting;                    // guarded by _gate
-    private long _lastDrain;
+    private Throttle? _throttle;                // paces drawing; capture itself is never delayed
 
     private Rgb[] _pattern = [];
     private long _excludedAtTicks;
@@ -93,11 +92,13 @@ public sealed partial class MainWindow : Window
     private CanvasBitmap? _bezelMap;
     private (int Width, int Height, float Radius, float Bezel) _bezelKey;
 
-    private int _acceptedFrames;
+    private readonly StageCounters _counters = new();
+    private StageRates _rates;
+    private long _lastDdaSource;
     private long _fpsWindowStart = Stopwatch.GetTimestamp();
     private long _cpuSampleStart = Stopwatch.GetTimestamp();
     private TimeSpan _cpuSample;
-    private double _fps, _ageMs, _copyMs, _drawMs, _cpuPct;
+    private double _ageMs, _copyMs, _drawMs, _cpuPct;
 
     public MainWindow()
     {
@@ -105,7 +106,6 @@ public sealed partial class MainWindow : Window
         _dispatcher = DispatcherQueue;
         _hwnd = WindowNative.GetWindowHandle(this);
         _verifyTimer = MakeTimer(VerifyTimeout, false, OnVerifyTimeout);
-        _drainTimer = MakeTimer(_minFrameInterval, false, Drain);
         _metricsTimer = MakeTimer(TimeSpan.FromSeconds(1), true, OnMetricsTick);
         _nudgeTimer = MakeTimer(NudgeInterval, true, OnNudge);
         _autoStopTimer = MakeTimer(AutoStopAfter, false, () => StopCapture("Auto-stopped after 10 minutes; Acrylic restored."));
@@ -300,13 +300,19 @@ public sealed partial class MainWindow : Window
             _displayHz = Native.GetRefreshRateHz(_hwnd);
             _pattern = ProbePattern.Create(Random.Shared);
             _padPx = (int)Math.Ceiling(BlurDip * _scale * 3) + 2;
-            _acceptedFrames = 0;
+            ResetStats();
 
+            _throttle = new Throttle(TimeSpan.Zero, QueueDrain);
             _pool = Direct3D11CaptureFramePool.CreateFreeThreaded(
                 GlassCanvas.Device, DirectXPixelFormat.B8G8R8A8UIntNormalized, FrameBuffers, item.Size);
             _pool.FrameArrived += OnFrameArrived;
             _session = _pool.CreateCaptureSession(item);
             _session.IsCursorCaptureEnabled = false;
+            // Windows 11 24H2 defaults to a ~60 Hz minimum update interval that undershoots in practice;
+            // Microsoft's capture-sample maintainer recommends a small non-zero value.
+            if (Windows.Foundation.Metadata.ApiInformation.IsPropertyPresent(
+                    "Windows.Graphics.Capture.GraphicsCaptureSession", "MinUpdateInterval"))
+                _session.MinUpdateInterval = TimeSpan.FromMilliseconds(1);
             if (hideBorder && Windows.Foundation.Metadata.ApiInformation.IsPropertyPresent(
                     "Windows.Graphics.Capture.GraphicsCaptureSession", "IsBorderRequired"))
                 _session.IsBorderRequired = false; // honored only because Windows reported Allowed above
@@ -395,14 +401,15 @@ public sealed partial class MainWindow : Window
             }
 
             _pattern = ProbePattern.Create(Random.Shared);
-            _acceptedFrames = 0;
+            ResetStats();
             _api = CaptureApi.Duplication;
             _displayHz = Native.GetRefreshRateHz(_hwnd);
             _borderNote = string.Empty;
             _crop = new CanvasRenderTarget(GlassCanvas.Device, crop.Width, crop.Height, 96f);
             Native.SetWindowDisplayAffinity(_hwnd, Native.WdaNone); // step 1 needs the panel capturable
+            _throttle = new Throttle(TimeSpan.Zero, QueueDuplicationWake);
             _dda = DuplicationSource.Start(
-                GlassCanvas.Device, _crop, hmonitor, monitor, crop, _minFrameInterval, OnDuplicationFrame, OnDuplicationFault);
+                GlassCanvas.Device, _crop, hmonitor, monitor, crop, OnDuplicationFrame, OnDuplicationFault);
 
             _mode = Mode.ProbeVisible;
             ApplyModeUi();
@@ -421,12 +428,18 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    // Worker thread: keep the newest frame's details and wake the UI thread at most once at a time.
+    // Worker thread: the panel crop is already copied; note its details and let the throttle decide when to draw.
     private void OnDuplicationFrame(DuplicationFrame frame)
     {
         Interlocked.Exchange(ref _ddaPresentTicks, frame.PresentTicks);
         Volatile.Write(ref _ddaCopyMs, frame.CopyMs);
         Volatile.Write(ref _ddaProtected, frame.ProtectedMasked);
+        _throttle?.Signal();
+    }
+
+    // Throttle callback (worker or timer thread): wake the UI thread at most once at a time.
+    private void QueueDuplicationWake()
+    {
         if (Interlocked.Exchange(ref _ddaWake, 1) == 0 && !_dispatcher.TryEnqueue(OnDuplicationWake))
             Interlocked.Exchange(ref _ddaWake, 0);
     }
@@ -484,7 +497,7 @@ public sealed partial class MainWindow : Window
         long now100ns = (long)(Stopwatch.GetTimestamp() * (TimeSpan.TicksPerSecond / (double)Stopwatch.Frequency));
         _ageMs = presentTicks <= 0 ? 0 : Math.Max(0, (now100ns - presentTicks) / (double)TimeSpan.TicksPerMillisecond);
         _copyMs = Volatile.Read(ref _ddaCopyMs);
-        _acceptedFrames++;
+        _counters.Add(Stage.Used);
         GlassCanvas.Invalidate();
     }
 
@@ -516,7 +529,6 @@ public sealed partial class MainWindow : Window
         if (frame is null)
             return;
 
-        bool queue;
         lock (_gate)
         {
             if (!_accepting)
@@ -526,27 +538,24 @@ public sealed partial class MainWindow : Window
             }
             _pending?.Dispose();
             _pending = frame;
-            queue = !_drainQueued;
+        }
+
+        _counters.Add(Stage.Source);
+        _throttle?.Signal();
+    }
+
+    // Throttle callback (pool or timer thread): process the newest frame on the UI thread.
+    private void QueueDrain()
+    {
+        lock (_gate)
+        {
+            if (_drainQueued)
+                return;
             _drainQueued = true;
         }
 
-        if (queue && !_dispatcher.TryEnqueue(ScheduleDrain))
+        if (!_dispatcher.TryEnqueue(Drain))
             lock (_gate) { _drainQueued = false; }
-    }
-
-    // Trailing-edge throttle: the last change is always processed, never dropped.
-    private void ScheduleDrain()
-    {
-        TimeSpan wait = _mode == Mode.Refracting
-            ? _minFrameInterval - Stopwatch.GetElapsedTime(_lastDrain)
-            : TimeSpan.Zero;
-        if (wait <= TimeSpan.Zero)
-            Drain();
-        else
-        {
-            _drainTimer.Interval = wait;
-            _drainTimer.Start();
-        }
     }
 
     private void Drain()
@@ -561,7 +570,6 @@ public sealed partial class MainWindow : Window
         if (frame is null)
             return;
 
-        _lastDrain = Stopwatch.GetTimestamp();
         try { ProcessFrame(frame); }
         catch (Exception ex) { StopCapture($"Capture stopped ({ex.Message}); Acrylic restored."); }
         finally { frame.Dispose(); }
@@ -639,6 +647,8 @@ public sealed partial class MainWindow : Window
         _verifyTimer.Stop();
         _nudgeTimer.Stop();
         _mode = Mode.Refracting;
+        if (_throttle is not null)
+            _throttle.Interval = _minFrameInterval;
         string border = _borderNote.Length > 0 ? $"  ·  {_borderNote}" : string.Empty;
         SetStatus($"{source}  ·  exclusion verified (probe seen {_controlFraction:P0} → {_clearFraction:P0})  ·  only the panel crop is kept, in GPU memory{border}");
         ApplyModeUi();
@@ -665,7 +675,7 @@ public sealed partial class MainWindow : Window
         _copyMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
         long now100ns = (long)(Stopwatch.GetTimestamp() * (TimeSpan.TicksPerSecond / (double)Stopwatch.Frequency));
         _ageMs = Math.Max(0, (now100ns - frame.SystemRelativeTime.Ticks) / (double)TimeSpan.TicksPerMillisecond);
-        _acceptedFrames++;
+        _counters.Add(Stage.Used);
         GlassCanvas.Invalidate();
         return true;
     }
@@ -680,7 +690,10 @@ public sealed partial class MainWindow : Window
             if (_mode is Mode.ProbeVisible or Mode.ProbeExcluded)
                 DrawProbe(args.DrawingSession);
             else if (_mode == Mode.Refracting && _crop is not null)
+            {
                 DrawRefraction(sender, args.DrawingSession, w, h);
+                _counters.Add(Stage.Drawn);
+            }
             _drawMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
         }
         catch (Exception ex)
@@ -795,15 +808,14 @@ public sealed partial class MainWindow : Window
         if (sender is not ComboBox { SelectedItem: ComboBoxItem { Tag: string tag } } || !int.TryParse(tag, out int fps))
             return;
         _minFrameInterval = FramePacing.MinInterval(fps);
-        if (_dda is not null)
-            _dda.MinInterval = _minFrameInterval;
+        if (_mode == Mode.Refracting && _throttle is not null)
+            _throttle.Interval = _minFrameInterval;
     }
 
     private void StopCapture(string status)
     {
         _mode = Mode.Acrylic;
         _verifyTimer.Stop();
-        _drainTimer.Stop();
         _metricsTimer.Stop();
         _nudgeTimer.Stop();
         _autoStopTimer.Stop();
@@ -828,6 +840,8 @@ public sealed partial class MainWindow : Window
         _pool = null;
         _dda?.Dispose(); // joins the worker before the crop it writes to is released
         _dda = null;
+        _throttle?.Dispose();
+        _throttle = null;
         _crop?.Dispose();
         _crop = null;
         DisposeEffects();
@@ -870,13 +884,24 @@ public sealed partial class MainWindow : Window
 
     private void SetStatus(string text) => StatusText.Text = text;
 
+    private void ResetStats()
+    {
+        _counters.TakeRates(TimeSpan.FromSeconds(1));
+        _rates = default;
+        _lastDdaSource = 0;
+        _fpsWindowStart = Stopwatch.GetTimestamp();
+    }
+
     private void OnMetricsTick()
     {
         long now = Stopwatch.GetTimestamp();
-        double window = Stopwatch.GetElapsedTime(_fpsWindowStart, now).TotalSeconds;
-        if (window > 0)
-            _fps = _acceptedFrames / window;
-        _acceptedFrames = 0;
+        if (_dda is not null)
+        {
+            long source = _dda.SourceUpdates;
+            _counters.Add(Stage.Source, source - _lastDdaSource);
+            _lastDdaSource = source;
+        }
+        _rates = _counters.TakeRates(Stopwatch.GetElapsedTime(_fpsWindowStart, now));
         _fpsWindowStart = now;
 
         TimeSpan cpu = _process.TotalProcessorTime;
@@ -887,7 +912,7 @@ public sealed partial class MainWindow : Window
 
         string hz = _displayHz > 0 ? $"{_displayHz} Hz" : "? Hz";
         MetricsText.Text = _mode == Mode.Refracting
-            ? $"{(_api == CaptureApi.Duplication ? "DXGI" : "WGC")} · {_fps:0.0} fps (display {hz}) · age {_ageMs:0} ms · copy {_copyMs:0.0} ms · draw {_drawMs:0.0} ms · CPU {_cpuPct:0}% of 1 core · {Environment.WorkingSet / (1024 * 1024)} MB" +
+            ? $"{(_api == CaptureApi.Duplication ? "DXGI" : "WGC")} · per second: source {_rates.Source:0} → used {_rates.Used:0} → drawn {_rates.Drawn:0} (display {hz}) · age {_ageMs:0} ms · copy {_copyMs:0.0} ms · draw {_drawMs:0.0} ms · CPU {_cpuPct:0}% of 1 core · {Environment.WorkingSet / (1024 * 1024)} MB" +
               (Volatile.Read(ref _ddaProtected) ? " · protected content is masked (black) on this display" : string.Empty)
             : string.Empty;
     }

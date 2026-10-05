@@ -3,7 +3,7 @@ namespace RefractionLab.Logic;
 public static class FramePacing
 {
     public const int Unlimited = 0;
-    public const int DefaultFps = 30;
+    public const int DefaultFps = 60;
     public static readonly int[] Options = [15, 30, 60, Unlimited];
 
     /// <summary>Minimum time between processed frames. <see cref="Unlimited"/> means as fast as frames arrive.</summary>

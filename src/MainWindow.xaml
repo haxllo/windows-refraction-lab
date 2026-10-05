@@ -100,8 +100,12 @@
             <ComboBoxItem Content="60" Tag="60" />
             <ComboBoxItem Content="Unlimited" Tag="0" />
           </ComboBox>
-          <CheckBox x:Name="BorderlessBox" Content="Ask Windows to hide border (B)" MinWidth="0" Margin="12,0,0,0" FontSize="11"
+        </StackPanel>
+        <StackPanel Orientation="Horizontal" Spacing="16">
+          <CheckBox x:Name="BorderlessBox" Content="Ask Windows to hide border (B)" MinWidth="0" FontSize="11"
                     ToolTipService.ToolTip="Mode B only. Windows shows its own consent prompt and decides; if it refuses, the border stays." />
+          <CheckBox x:Name="LogBox" Content="Log stats to file" MinWidth="0" FontSize="11"
+                    ToolTipService.ToolTip="Off by default. While capture runs, writes one CSV row per second of the numbers shown here (no screen content) to %LOCALAPPDATA%\RefractionLab\logs." />
         </StackPanel>
       </StackPanel>
 
@@ -110,8 +114,8 @@
           <RowDefinition Height="Auto" />
           <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
-        <TextBlock x:Name="StatusText" Text="Acrylic baseline  ·  desktop capture is off" FontSize="10" Foreground="#FFAEB6C2" TextWrapping="Wrap" MaxLines="2" />
-        <TextBlock x:Name="MetricsText" Grid.Row="1" FontSize="9" Foreground="#FF8E95A1" Margin="0,3,0,0" TextWrapping="Wrap" />
+        <TextBlock x:Name="StatusText" Text="Acrylic baseline  ·  desktop capture is off" FontSize="10" Foreground="#FFAEB6C2" TextWrapping="Wrap" MaxLines="3" IsTextSelectionEnabled="True" />
+        <TextBlock x:Name="MetricsText" Grid.Row="1" FontSize="9" Foreground="#FF8E95A1" Margin="0,3,0,0" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
       </Grid>
     </Grid>
   </Grid>

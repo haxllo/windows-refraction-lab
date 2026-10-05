@@ -8,6 +8,10 @@ public enum ThrottleAction { Nothing, Fire, Arm }
 ///
 /// Signal: a change happened. Fire = act now; Arm = call Tick after armFor; Nothing = a timer is already pending.
 /// Tick:   the armed timer elapsed. Same return values.
+///
+/// Fires follow a fixed schedule (next = previous due + interval) rather than "last fire + interval", so a
+/// late timer or frame does not push every later frame back. That keeps a source slightly faster than the cap
+/// at the cap even though timers overshoot by up to a system tick.
 /// </summary>
 public sealed class ThrottleGate
 {
@@ -15,7 +19,7 @@ public sealed class ThrottleGate
 
     private readonly object _lock = new();
     private TimeSpan _interval;
-    private TimeSpan _lastFire;
+    private TimeSpan _nextDue;
     private bool _hasFired;
     private bool _dirty;
     private bool _armed;
@@ -23,7 +27,15 @@ public sealed class ThrottleGate
     public TimeSpan Interval
     {
         get { lock (_lock) return _interval; }
-        set { lock (_lock) _interval = value < TimeSpan.Zero ? TimeSpan.Zero : value; }
+        set
+        {
+            lock (_lock)
+            {
+                TimeSpan next = value < TimeSpan.Zero ? TimeSpan.Zero : value;
+                _nextDue += next - _interval; // _nextDue is last fire + interval, so move it with the interval
+                _interval = next;
+            }
+        }
     }
 
     public ThrottleAction Signal(TimeSpan now, out TimeSpan armFor)
@@ -54,8 +66,7 @@ public sealed class ThrottleGate
         if (wait <= TimeSpan.Zero)
         {
             _dirty = false;
-            _lastFire = now;
-            _hasFired = true;
+            Advance(now);
             return ThrottleAction.Fire;
         }
 
@@ -66,15 +77,23 @@ public sealed class ThrottleGate
         return ThrottleAction.Arm;
     }
 
-    // A signal arriving slightly early (display-sync jitter) counts as due, so a 60 fps cap
-    // on a 60 Hz source passes every frame instead of waiting a whole extra timer tick.
+    // Stay on the schedule, but re-anchor after idle (or a first fire) so there is no burst of catch-up fires.
+    private void Advance(TimeSpan now)
+    {
+        if (!_hasFired || now - _nextDue >= _interval)
+            _nextDue = now;
+        _nextDue += _interval;
+        _hasFired = true;
+    }
+
+    // A signal arriving slightly early (display-sync jitter) counts as due.
     private TimeSpan Remaining(TimeSpan now)
     {
         if (!_hasFired || _interval <= TimeSpan.Zero)
             return TimeSpan.Zero;
 
         TimeSpan tolerance = TimeSpan.FromTicks(Math.Min(MaxEarly.Ticks, _interval.Ticks / 4));
-        TimeSpan wait = _interval - (now - _lastFire);
+        TimeSpan wait = _nextDue - now;
         return wait <= tolerance ? TimeSpan.Zero : wait;
     }
 }

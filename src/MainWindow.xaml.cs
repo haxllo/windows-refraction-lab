@@ -35,7 +35,7 @@ public sealed partial class MainWindow : Window
     private readonly record struct Client(int Width, int Height, int ScreenX, int ScreenY);
 
     private const double PanelWidthDip = 700;   // Nex WINDOW_WIDTH
-    private const double PanelHeightDip = 396;
+    private const double PanelHeightDip = 410;
     private const double BezelDip = 32;
     private const double CornerDip = 8;
     private const double BlurDip = 3;
@@ -66,6 +66,9 @@ public sealed partial class MainWindow : Window
     private long _ddaPresentTicks;
     private double _ddaCopyMs;
     private bool _ddaProtected;
+    private double _ddaLockMs;
+    private long _queuedAt;        // when the pending UI work item was queued; 0 = none
+    private long _invalidatedAt;   // first Invalidate not yet drawn; 0 = none
 
     private string _borderNote = string.Empty;
     private int _displayHz;
@@ -99,6 +102,9 @@ public sealed partial class MainWindow : Window
     private long _cpuSampleStart = Stopwatch.GetTimestamp();
     private TimeSpan _cpuSample;
     private double _ageMs, _copyMs, _drawMs, _cpuPct;
+    private readonly LatencyWindow _dispatchLag = new();   // throttle fire -> handler runs on the UI thread
+    private readonly LatencyWindow _renderLag = new();     // Invalidate -> Draw event
+    private LatencySummary _dispatchSummary, _renderSummary;
 
     public MainWindow()
     {
@@ -433,6 +439,7 @@ public sealed partial class MainWindow : Window
     {
         Interlocked.Exchange(ref _ddaPresentTicks, frame.PresentTicks);
         Volatile.Write(ref _ddaCopyMs, frame.CopyMs);
+        Volatile.Write(ref _ddaLockMs, frame.LockMs);
         Volatile.Write(ref _ddaProtected, frame.ProtectedMasked);
         _throttle?.Signal();
     }
@@ -440,7 +447,11 @@ public sealed partial class MainWindow : Window
     // Throttle callback (worker or timer thread): wake the UI thread at most once at a time.
     private void QueueDuplicationWake()
     {
-        if (Interlocked.Exchange(ref _ddaWake, 1) == 0 && !_dispatcher.TryEnqueue(OnDuplicationWake))
+        if (Interlocked.Exchange(ref _ddaWake, 1) != 0)
+            return;
+
+        Volatile.Write(ref _queuedAt, Stopwatch.GetTimestamp());
+        if (!_dispatcher.TryEnqueue(OnDuplicationWake))
             Interlocked.Exchange(ref _ddaWake, 0);
     }
 
@@ -453,6 +464,7 @@ public sealed partial class MainWindow : Window
 
     private void OnDuplicationWake()
     {
+        NoteDispatched();
         Interlocked.Exchange(ref _ddaWake, 0);
         if (_closing || _api != CaptureApi.Duplication || _crop is null || _mode is Mode.Acrylic or Mode.Picking)
             return;
@@ -498,7 +510,7 @@ public sealed partial class MainWindow : Window
         _ageMs = presentTicks <= 0 ? 0 : Math.Max(0, (now100ns - presentTicks) / (double)TimeSpan.TicksPerMillisecond);
         _copyMs = Volatile.Read(ref _ddaCopyMs);
         _counters.Add(Stage.Used);
-        GlassCanvas.Invalidate();
+        RequestDraw();
     }
 
     // The probe sits inside the panel, so it is also inside the crop already copied on the GPU.
@@ -554,12 +566,14 @@ public sealed partial class MainWindow : Window
             _drainQueued = true;
         }
 
+        Volatile.Write(ref _queuedAt, Stopwatch.GetTimestamp());
         if (!_dispatcher.TryEnqueue(Drain))
             lock (_gate) { _drainQueued = false; }
     }
 
     private void Drain()
     {
+        NoteDispatched();
         Direct3D11CaptureFrame? frame;
         lock (_gate)
         {
@@ -676,13 +690,16 @@ public sealed partial class MainWindow : Window
         long now100ns = (long)(Stopwatch.GetTimestamp() * (TimeSpan.TicksPerSecond / (double)Stopwatch.Frequency));
         _ageMs = Math.Max(0, (now100ns - frame.SystemRelativeTime.Ticks) / (double)TimeSpan.TicksPerMillisecond);
         _counters.Add(Stage.Used);
-        GlassCanvas.Invalidate();
+        RequestDraw();
         return true;
     }
 
     private void OnGlassDraw(CanvasControl sender, CanvasDrawEventArgs args)
     {
         long started = Stopwatch.GetTimestamp();
+        long invalidatedAt = Interlocked.Exchange(ref _invalidatedAt, 0);
+        if (invalidatedAt != 0 && _mode == Mode.Refracting)
+            _renderLag.Add(Stopwatch.GetElapsedTime(invalidatedAt).TotalMilliseconds);
         try
         {
             float w = (float)sender.Size.Width;
@@ -887,9 +904,25 @@ public sealed partial class MainWindow : Window
     private void ResetStats()
     {
         _counters.TakeRates(TimeSpan.FromSeconds(1));
+        _dispatchLag.Take();
+        _renderLag.Take();
+        _dispatchSummary = _renderSummary = default;
         _rates = default;
         _lastDdaSource = 0;
         _fpsWindowStart = Stopwatch.GetTimestamp();
+    }
+
+    private void NoteDispatched()
+    {
+        long queuedAt = Interlocked.Exchange(ref _queuedAt, 0);
+        if (queuedAt != 0)
+            _dispatchLag.Add(Stopwatch.GetElapsedTime(queuedAt).TotalMilliseconds);
+    }
+
+    private void RequestDraw()
+    {
+        Interlocked.CompareExchange(ref _invalidatedAt, Stopwatch.GetTimestamp(), 0);
+        GlassCanvas.Invalidate();
     }
 
     private void OnMetricsTick()
@@ -902,6 +935,8 @@ public sealed partial class MainWindow : Window
             _lastDdaSource = source;
         }
         _rates = _counters.TakeRates(Stopwatch.GetElapsedTime(_fpsWindowStart, now));
+        _dispatchSummary = _dispatchLag.Take();
+        _renderSummary = _renderLag.Take();
         _fpsWindowStart = now;
 
         TimeSpan cpu = _process.TotalProcessorTime;
@@ -911,8 +946,10 @@ public sealed partial class MainWindow : Window
         _cpuSampleStart = now;
 
         string hz = _displayHz > 0 ? $"{_displayHz} Hz" : "? Hz";
+        string lag = $"lag avg/max ms: ui queue {_dispatchSummary.AvgMs:0}/{_dispatchSummary.MaxMs:0} · invalidate→draw {_renderSummary.AvgMs:0}/{_renderSummary.MaxMs:0}" +
+            (_api == CaptureApi.Duplication ? $" · device lock {Volatile.Read(ref _ddaLockMs):0.0}" : string.Empty);
         MetricsText.Text = _mode == Mode.Refracting
-            ? $"{(_api == CaptureApi.Duplication ? "DXGI" : "WGC")} · per second: source {_rates.Source:0} → used {_rates.Used:0} → drawn {_rates.Drawn:0} (display {hz}) · age {_ageMs:0} ms · copy {_copyMs:0.0} ms · draw {_drawMs:0.0} ms · CPU {_cpuPct:0}% of 1 core · {Environment.WorkingSet / (1024 * 1024)} MB" +
+            ? $"{(_api == CaptureApi.Duplication ? "DXGI" : "WGC")} · per second: source {_rates.Source:0} → used {_rates.Used:0} → drawn {_rates.Drawn:0} (display {hz}) · age {_ageMs:0} ms · copy {_copyMs:0.0} ms · draw {_drawMs:0.0} ms · CPU {_cpuPct:0}% of 1 core · {Environment.WorkingSet / (1024 * 1024)} MB\n{lag}" +
               (Volatile.Read(ref _ddaProtected) ? " · protected content is masked (black) on this display" : string.Empty)
             : string.Empty;
     }

@@ -11,7 +11,7 @@
         IsHitTestVisible="False"
         Draw="OnGlassDraw" />
 
-    <!-- Nex acrylic tokens: --panel-surface rgba(17,20,27,.12), --panel-edge rgba(255,255,255,.2), --radius 8px -->
+    <!-- Nex acrylic tokens: panel-surface rgba(17,20,27,.12), panel-edge rgba(255,255,255,.2), radius 8px -->
     <Border
         x:Name="GlassTint"
         Background="#1F11141B"

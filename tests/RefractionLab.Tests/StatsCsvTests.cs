@@ -136,6 +136,18 @@ public class StatsCsvTests
         Assert.Equal("", row[Array.IndexOf(Split(StatsCsv.Header).ToArray(), "source_per_s")]);
     }
 
+    [Theory]
+    [InlineData(true, "1")]
+    [InlineData(false, "0")]
+    [InlineData(null, "")]
+    public void ProtectedFlagIsEmptyWhenTheCaptureApiHasNoSuchSignal(bool? masked, string expected)
+    {
+        string[] names = Split(StatsCsv.Header).ToArray();
+        string[] row = Split(StatsCsv.Row(At, 1, Sample() with { ProtectedMasked = masked })).ToArray();
+        Assert.Equal(StatsCsv.ColumnCount, row.Length);
+        Assert.Equal(expected, row[Array.IndexOf(names, "protected_masked")]);
+    }
+
     [Fact]
     public void EventTextIsEscapedAndReducedToAscii()
     {
